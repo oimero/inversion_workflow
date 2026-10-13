@@ -27,7 +27,7 @@ from ginn_v3.model import PIAINetwork
 from ginn_v3.types import ForwardResult, ObservationBatch, Prediction, TrainingResult, WellBatch
 
 
-CHECKPOINT_SCHEMA = "ginn_v3_checkpoint_v1"
+CHECKPOINT_SCHEMA = "ginn_v3_checkpoint_v2"
 
 
 def _as_float(value: Any, *, name: str) -> float:
@@ -393,6 +393,7 @@ class JointTrainer:
             "normalization": dict(self._normalization),
             "sample_axis": _sample_axis_metadata(axis),
             "wavelet_time_s": self._wavelet_time(),
+            "interface_alignment": "midpoint",
             "mean_wavelet_normalized": mean_wavelet.detach().cpu().reshape(-1).tolist(),
             "mean_wavelet_cohort": {
                 "kind": "all_train_keys",
@@ -581,6 +582,8 @@ def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> dic
     payload = torch.load(Path(path), map_location=device, weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_SCHEMA:
         raise ValueError(f"Unsupported or missing v3 checkpoint schema: {payload.get('schema') if isinstance(payload, dict) else None!r}.")
+    if payload.get("interface_alignment") != "midpoint":
+        raise ValueError("GINN v3 checkpoints require midpoint reflection interfaces.")
     model = PIAINetwork(NetworkConfig.from_mapping(payload["model_config"]))
     model.load_state_dict(payload["model_state"])
     model.to(device)

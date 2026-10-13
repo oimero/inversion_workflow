@@ -204,6 +204,31 @@ def _relative_twt_axes(
     return sample_twt, interface_twt
 
 
+def relative_twt_from_depth(
+    velocity_mps: Any,
+    depth_m: Any,
+) -> tuple[Tensor, Tensor]:
+    """Return float64 sample and midpoint-interface TWT axes.
+
+    ``velocity_mps`` may have shape ``[..., N]`` and ``depth_m`` has shape
+    ``(N,)``.  The returned arrays keep the leading velocity dimensions and
+    have shapes ``[..., N]`` and ``[..., N - 1]`` respectively.  The
+    kinematic calculation is intentionally promoted to float64 while the
+    legacy ``forward_depth`` entry point retains its existing dtype policy.
+    """
+
+    velocity, depth = _validate_velocity_depth(velocity_mps, depth_m)
+    original_shape = tuple(velocity.shape)
+    n_samples = int(original_shape[-1])
+    velocity_flat = velocity.to(dtype=torch.float64).reshape((-1, n_samples))
+    depth_float64 = depth.to(device=velocity.device, dtype=torch.float64)
+    sample_twt, interface_twt = _relative_twt_axes(velocity_flat, depth_float64)
+    return (
+        sample_twt.reshape(original_shape),
+        interface_twt.reshape((*original_shape[:-1], n_samples - 1)),
+    )
+
+
 def _wavelet_weights(
     sample_twt: Tensor,
     interface_twt: Tensor,
@@ -225,6 +250,121 @@ def _wavelet_weights(
     alpha = (tau_s - t0) / (t1 - t0)
     values = a0 + alpha * (a1 - a0)
     return torch.where(outside, torch.zeros_like(values), values)
+
+
+def _validate_sample_times(
+    sample_time_s: Any,
+    *,
+    batch_size: int,
+    n_samples: int,
+    device: torch.device,
+) -> Tensor:
+    """Validate and broadcast a common or per-trace sample-time axis."""
+
+    values = _floating_tensor(sample_time_s, name="sample_time_s")
+    if values.ndim == 1:
+        if values.numel() != n_samples:
+            raise ValueError(
+                "sample_time_s length must match the final log_ai dimension, "
+                f"got {values.numel()} and {n_samples}."
+            )
+        values = values.reshape(1, n_samples).expand(batch_size, -1)
+    elif values.ndim == 2:
+        if values.shape != (batch_size, n_samples):
+            raise ValueError(
+                "A per-trace sample_time_s axis must match the flattened log_ai "
+                f"shape {(batch_size, n_samples)}, got {tuple(values.shape)}."
+            )
+    else:
+        raise ValueError("sample_time_s must be one-dimensional or have shape (B, N).")
+    values = values.to(device=device, dtype=torch.float64)
+    if bool(torch.any(values[:, 1:] <= values[:, :-1]).item()):
+        raise ValueError("sample_time_s must be strictly increasing on every trace.")
+    return values
+
+
+def forward_at_interfaces(
+    log_ai: Any,
+    sample_time_s: Any,
+    wavelet_time_s: Any,
+    wavelet_amp: Any,
+    *,
+    output_chunk_size: int = DEFAULT_OUTPUT_CHUNK_SIZE,
+) -> Tensor:
+    """Forward model on sample-midpoint interfaces and arbitrary time axes.
+
+    ``sample_time_s`` is either one common ``(N,)`` relative-time axis or a
+    per-trace ``(B, N)`` axis.  The operator forms reflectivity between
+    adjacent impedance samples, places each event at the midpoint sample time,
+    linearly interpolates the kernel in seconds, and omits kernel-outside
+    pairs.  Kinematic times are float64; impedance, kernel, and output retain
+    their promoted input dtype.
+    """
+
+    values = _validate_log_ai(log_ai)
+    wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
+    chunk_size = _validate_output_chunk_size(output_chunk_size)
+    n_samples = int(values.shape[-1])
+    batch_size = math.prod(values.shape[:-1]) if values.ndim > 1 else 1
+    output_shape = tuple(values.shape)
+    device = values.device
+    sample_times = _validate_sample_times(
+        sample_time_s,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        device=device,
+    )
+    dtype = _promoted_dtype(values, amplitude)
+    values_cast = values.to(dtype=dtype).reshape(batch_size, n_samples)
+    amplitude_cast = amplitude.to(device=device, dtype=dtype)
+    wavelet_times = wavelet_time.to(device=device, dtype=torch.float64)
+    reflectivity = torch.tanh(
+        0.5 * (values_cast[:, 1:] - values_cast[:, :-1])
+    )
+    interface_times = 0.5 * (sample_times[:, :-1] + sample_times[:, 1:])
+    outputs: list[Tensor] = []
+    wavelet_min = wavelet_times[0]
+    wavelet_max = wavelet_times[-1]
+    for start in range(0, n_samples, chunk_size):
+        stop = min(start + chunk_size, n_samples)
+        tau = sample_times[:, start:stop, None] - interface_times[:, None, :]
+        pairs = torch.nonzero(
+            (tau >= wavelet_min) & (tau <= wavelet_max),
+            as_tuple=False,
+        )
+        if pairs.numel() == 0:
+            zero = (values_cast.sum() + amplitude_cast.sum()) * 0.0
+            outputs.append(torch.zeros(
+                (batch_size, stop - start),
+                dtype=dtype,
+                device=device,
+            ) + zero)
+            continue
+        row, output_index, interface_index = pairs.unbind(dim=1)
+        selected_tau = tau[row, output_index, interface_index]
+        right = torch.searchsorted(
+            wavelet_times,
+            selected_tau.contiguous(),
+            right=False,
+        ).clamp(1, wavelet_times.numel() - 1)
+        left = right - 1
+        alpha = (
+            (selected_tau - wavelet_times[left])
+            / (wavelet_times[right] - wavelet_times[left])
+        ).to(dtype=dtype)
+        weights = (1.0 - alpha) * amplitude_cast[left] + alpha * amplitude_cast[right]
+        events = weights * reflectivity[row, interface_index]
+        flat = torch.zeros(
+            batch_size * (stop - start),
+            dtype=dtype,
+            device=device,
+        ).index_add(
+            0,
+            row * (stop - start) + output_index,
+            events,
+        )
+        outputs.append(flat.reshape(batch_size, stop - start))
+    return torch.cat(outputs, dim=1).reshape(output_shape)
 
 
 def forward_depth(
@@ -268,7 +408,9 @@ def forward_depth(
 
 __all__ = [
     "DEFAULT_OUTPUT_CHUNK_SIZE",
+    "forward_at_interfaces",
     "forward_depth",
     "forward_time",
+    "relative_twt_from_depth",
     "reflectivity_from_log_ai",
 ]

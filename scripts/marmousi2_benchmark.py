@@ -82,8 +82,8 @@ def main() -> None:
     parser.add_argument("--lfm-run-dir", type=Path, default=None)
     parser.add_argument("--variant-id", type=str, default=None)
     parser.add_argument("--well-control-run-dir", type=Path, default=None)
-    parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None)
-    parser.add_argument("--wavelet-generation-run-dir", type=Path, default=None)
+    parser.add_argument("--velocity-volume", type=Path, default=None,
+                        help="Optional velocity volume override for depth-domain inference.")
     parser.add_argument("--trusted-well-name", action="append", dest="trusted_well_names", default=None)
     args = parser.parse_args()
 
@@ -118,8 +118,7 @@ def main() -> None:
             lfm_run_dir=args.lfm_run_dir,
             variant_id=args.variant_id,
             well_control_run_dir=args.well_control_run_dir,
-            forward_model_inputs_run_dir=args.forward_model_inputs_run_dir,
-            wavelet_generation_run_dir=args.wavelet_generation_run_dir,
+            velocity_volume=args.velocity_volume,
             trusted_well_names=args.trusted_well_names,
             batch_size=args.batch_size,
             device=args.device,

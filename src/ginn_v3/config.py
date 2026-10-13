@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Mapping
 import math
 
+import numpy as np
+
 
 def _construct(cls, payload: Mapping[str, Any] | None):
     raw = dict(payload or {})
@@ -13,6 +15,45 @@ def _construct(cls, payload: Mapping[str, Any] | None):
     if unknown:
         raise ValueError(f"Unknown {cls.__name__} settings: {sorted(unknown)}")
     return cls(**raw)
+
+
+@dataclass(frozen=True)
+class KernelConfig:
+    """An independently configured, zero-centered temporal kernel grid."""
+
+    dt_s: float
+    duration_s: float | None = None
+    samples: int | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dt_s, bool) or not math.isfinite(self.dt_s) or self.dt_s <= 0.0:
+            raise ValueError("kernel.dt_s must be finite and positive seconds.")
+        if (self.duration_s is None) == (self.samples is None):
+            raise ValueError("Specify exactly one of duration_s and samples in kernel.")
+        if self.samples is not None:
+            if (isinstance(self.samples, bool) or int(self.samples) != self.samples
+                    or self.samples < 3 or self.samples % 2 == 0):
+                raise ValueError("kernel.samples must be an odd integer of at least three samples.")
+        elif (isinstance(self.duration_s, bool) or not math.isfinite(self.duration_s)
+              or self.duration_s < 2.0 * self.dt_s):
+            raise ValueError("kernel.duration_s must cover at least two kernel sample intervals.")
+
+    @property
+    def sample_count(self) -> int:
+        if self.samples is not None:
+            return int(self.samples)
+        half = int(math.floor(self.duration_s / (2.0 * self.dt_s) + 1e-9))
+        return 2 * half + 1
+
+    def time_axis_s(self) -> np.ndarray:
+        center = self.sample_count // 2
+        return (np.arange(self.sample_count, dtype=np.float64) - center) * self.dt_s
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "KernelConfig":
+        if not isinstance(payload, Mapping) or "dt_s" not in payload:
+            raise ValueError("kernel requires an explicit dt_s and either duration_s or samples.")
+        return _construct(cls, payload)
 
 
 @dataclass(frozen=True)
@@ -99,10 +140,16 @@ class TrainingConfig:
 class InferenceConfig:
     batch_size: int = 128
     min_support_samples: int = 8
+    device: str = "cpu"
 
     def __post_init__(self) -> None:
+        if any(isinstance(value, bool) or int(value) != value for value in
+               (self.batch_size, self.min_support_samples)):
+            raise ValueError("Inference batch and support lengths must be integers.")
         if self.batch_size <= 0 or self.min_support_samples < 2:
             raise ValueError("Inference batch and finite-support lengths must be positive.")
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError("Inference device must be explicit and non-empty.")
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None):

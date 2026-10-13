@@ -237,15 +237,14 @@ def prepare_marmousi2(vp_path: Path, density_path: Path, output_dir: Path, *, re
         "well_curves": {"required_categories": ["AI"], "selected_categories": ["AI", "VP", "RHOB"]},
         "spatial_debias": {"cluster_radius_m": spacing},
         "ginn_v3_body_inversion": {
+            "kernel": {
+                "dt_s": 0.002,
+                "duration_s": 0.2,
+            },
             "inputs": {
                 "lfm_run_dir": relative(lfm_dir),
                 "variant_id": "well_huber_trend",
                 "well_control_run_dir": relative(controls_dir),
-                "wavelet_generation_run_dir": relative(
-                    output_dir / "step5_wavelet_generation"
-                    if wavelet_source["method"] == "workflow_steps_4_5_pending"
-                    else wavelet_dir
-                ),
             },
             "trusted_well_names": [r["well_name"] for r in roles if r["role"] == "train"],
             "network": {

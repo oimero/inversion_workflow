@@ -491,7 +491,7 @@ def run_wavelet_workflow(
     repo_root: Path,
     pretrained_dir: Path | None = None,
 ):
-    """Build Wtie artifacts and connect the selected wavelet."""
+    """Build Wtie artifacts and publish the selected wavelet for QC."""
     prepared_dir, repo_root = Path(prepared_dir).resolve(), Path(repo_root).resolve()
     prepare_tie_inputs(prepared_dir, repo_root=repo_root, pretrained_dir=pretrained_dir)
     _network_wtie_artifacts(
@@ -503,11 +503,9 @@ def run_wavelet_workflow(
 
 
 def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
-    """Connect a completed Step 5 result to this dataset and its LFM configs."""
+    """Publish the selected Step 5 wavelet for independent Marmousi2 QC."""
     prepared_dir, repo_root = Path(prepared_dir).resolve(), Path(repo_root).resolve()
     selected_dir = prepared_dir / "step5_wavelet_generation"
-    base_path = prepared_dir / "ginn_v3.yaml"
-    config = load_config(base_path)
     wavelet = pd.read_csv(selected_dir / "selected_wavelet.csv")
     extractor_dt = float(np.median(np.diff(wavelet.time_s)))
     with np.load(prepared_dir / "evaluation" / "truth.npz", allow_pickle=False) as saved:
@@ -521,8 +519,6 @@ def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
     forward_dir = prepared_dir / "wavelet"
     forward_dir.mkdir(exist_ok=True)
     pd.DataFrame({"time_s": sampled_times, "amplitude": sampled_wavelet}).to_csv(forward_dir / "selected_wavelet.csv", index=False)
-    config["ginn_v3_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
-    base_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     roles = pd.read_csv(prepared_dir / "evaluation" / "well_roles.csv")
     training = roles.loc[roles.role == "train"]
     metrics = pd.read_csv(prepared_dir / "step4_well_auto_tie" / "well_tie_metrics.csv")
@@ -547,9 +543,4 @@ def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
     preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
     preparation["wavelet_source"] = summary
     write_json(preparation_path, preparation)
-    # Update variant configs too if the user recalibrates after creating LFMs.
-    for path in (prepared_dir / "lfm_models").glob("*/configs/*.yaml"):
-        variant = load_config(path)
-        variant["ginn_v3_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
-        path.write_text(yaml.safe_dump(variant, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return summary

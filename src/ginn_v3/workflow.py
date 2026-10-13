@@ -19,13 +19,11 @@ import torch
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.lfm.artifacts import load_lfm_input
 from cup.physics.relations import AIVelocityRelation
-from cup.seismic.forward_inputs import load_forward_inputs
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv, validate_wavelet_dt
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
 from cup.well.controls import load_evaluation_support_for_run, load_well_control_set
-from ginn_v3.config import InferenceConfig, NetworkConfig, TrainingConfig
+from ginn_v3.config import InferenceConfig, KernelConfig, NetworkConfig, TrainingConfig
 from ginn_v3.data import SurveyTraceSource, prepare_training_data
 from ginn_v3.infer import Inverter, VolumePrediction
 from ginn_v3.model import PIAINetwork
@@ -44,8 +42,7 @@ class _Overrides:
     lfm_run_dir: Path | None = None
     variant_id: str | None = None
     well_control_run_dir: Path | None = None
-    forward_model_inputs_run_dir: Path | None = None
-    wavelet_generation_run_dir: Path | None = None
+    velocity_volume: Path | None = None
     trusted_well_names: tuple[str, ...] | None = None
     device: str | None = None
     batch_size: int | None = None
@@ -59,7 +56,6 @@ class _Runtime:
     config_path: Path
     lfm_run_dir: Path
     well_control_run_dir: Path
-    forward_source_dir: Path
     variant_id: str
     lfm: Any
     survey: Any
@@ -70,11 +66,8 @@ class _Runtime:
     data: Any
     physics: AcousticPhysics
     wavelet_time_s: np.ndarray
-    reference_wavelet_time_s: np.ndarray
-    reference_wavelet_amplitude: np.ndarray
     normalization: Normalization
     velocity_mps: np.ndarray | None
-    relation: AIVelocityRelation | None
     velocity_source: str
     trusted_well_names: tuple[str, ...]
 
@@ -95,13 +88,11 @@ class LoadedBody:
     model: PIAINetwork
     physics: AcousticPhysics
     normalization: Normalization
-    reference_wavelet_time_s: np.ndarray
-    reference_wavelet_amplitude: np.ndarray
     inference_config: InferenceConfig
     output_dir: Path | None = None
 
     def _inverter(self, batch_size: int | None = None) -> Inverter:
-        size = int(batch_size or self.inference_config.batch_size)
+        size = self.inference_config.batch_size if batch_size is None else batch_size
         return Inverter(
             self.model,
             self.reader,
@@ -189,6 +180,17 @@ def _section(raw: Mapping[str, Any]) -> Mapping[str, Any]:
     section = raw.get("ginn_v3_body_inversion")
     if not isinstance(section, Mapping):
         raise ValueError("Config lacks explicit ginn_v3_body_inversion section.")
+    unknown = set(section) - {"inputs", "kernel", "network", "training", "inference", "trusted_well_names"}
+    if unknown:
+        raise ValueError(f"Unknown ginn_v3_body_inversion settings: {sorted(unknown)}")
+    inputs = section.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise ValueError("ginn_v3_body_inversion.inputs must be a mapping.")
+    unknown_inputs = set(inputs) - {
+        "lfm_run_dir", "variant_id", "well_control_run_dir", "velocity_volume", "ai_velocity_relation"
+    }
+    if unknown_inputs:
+        raise ValueError(f"Unknown ginn_v3_body_inversion.inputs settings: {sorted(unknown_inputs)}")
     return section
 
 
@@ -216,38 +218,10 @@ def _resolve_inputs(section: Mapping[str, Any], overrides: _Overrides) -> tuple[
     return lfm_run_dir, well_control_run_dir, variant_id
 
 
-def _resolve_forward_source(
-    section: Mapping[str, Any],
-    *,
-    domain: str,
-    overrides: _Overrides,
-) -> Path:
-    inputs = section.get("inputs")
-    if not isinstance(inputs, Mapping):
-        raise ValueError("ginn_v3_body_inversion.inputs must be a mapping.")
-    if domain == "depth":
-        if inputs.get("wavelet_generation_run_dir") is not None or overrides.wavelet_generation_run_dir is not None:
-            raise ValueError("Depth PIAI uses forward_model_inputs_run_dir, not wavelet_generation_run_dir.")
-        return resolve_relative_path(
-            _required_input(section, "forward_model_inputs_run_dir", overrides.forward_model_inputs_run_dir),
-            root=REPO_ROOT,
-        )
-    if domain == "time":
-        if inputs.get("forward_model_inputs_run_dir") is not None or overrides.forward_model_inputs_run_dir is not None:
-            raise ValueError("Time PIAI uses wavelet_generation_run_dir, not forward_model_inputs_run_dir.")
-        return resolve_relative_path(
-            _required_input(section, "wavelet_generation_run_dir", overrides.wavelet_generation_run_dir),
-            root=REPO_ROOT,
-        )
-    raise ValueError(f"Unsupported seismic domain: {domain!r}.")
-
-
 def _resolve_trusted_names(section: Mapping[str, Any], overrides: _Overrides) -> tuple[str, ...]:
     value: object = overrides.trusted_well_names
     if value is None:
         value = section.get("trusted_well_names")
-    if value is None and isinstance(section.get("training"), Mapping):
-        value = section["training"].get("trusted_well_names")
     if not isinstance(value, (list, tuple)):
         raise ValueError("ginn_v3_body_inversion.trusted_well_names must be a non-empty list.")
     names = tuple(str(item).strip() for item in value)
@@ -286,114 +260,40 @@ def _require_matching_axes(*pairs: tuple[str, Any]) -> None:
             raise ValueError(f"{name} SampleAxis differs from {reference_name}.")
 
 
-def _load_reference_wavelet(
-    source_dir: Path,
-    *,
-    domain: str,
-    depth_basis: str | None,
-    sample_axis: Any,
-) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, Mapping[str, Any]]:
-    if domain == "depth":
-        time_s, amplitude, relation, payload = load_forward_inputs(
-            source_dir,
-            repo_root=REPO_ROOT,
-            domain=domain,
-            depth_basis=depth_basis,
-        )
-    else:
-        path = source_dir / "selected_wavelet.csv"
-        time_s, amplitude = load_wavelet_csv(path)
-        relation = None
-        payload = {"wavelet": {"path": repo_relative_path(path, root=REPO_ROOT)}}
-
-    time_s = np.asarray(time_s, dtype=np.float64).reshape(-1)
-    amplitude = np.asarray(amplitude, dtype=np.float64).reshape(-1)
-    if time_s.size < 3 or time_s.size % 2 != 1 or amplitude.shape != time_s.shape:
-        raise ValueError("The selected wavelet must have an odd number of samples and a matching amplitude array.")
-    if not np.all(np.isfinite(time_s)) or not np.all(np.isfinite(amplitude)):
-        raise ValueError("The selected wavelet must contain finite time and amplitude values.")
-    if not np.all(np.diff(time_s) > 0.0) or not np.allclose(np.diff(time_s), np.diff(time_s)[0], rtol=1e-6, atol=1e-12):
-        raise ValueError("The selected wavelet time axis must be regularly sampled and increasing.")
-    if not np.isclose(time_s[time_s.size // 2], 0.0, rtol=0.0, atol=1e-10):
-        raise ValueError("The selected wavelet time axis must be centered at zero seconds.")
-    if getattr(sample_axis, "domain", None) == "time":
-        validate_wavelet_dt(time_s, float(sample_axis.step))
-    else:
-        infer_wavelet_dt(time_s)
-    return time_s, amplitude, relation, payload
-
-
-def _configured_wavelet_samples(
-    section: Mapping[str, Any], reference_time_s: np.ndarray, *, sample_axis: Any,
-) -> int:
-    """Resolve a physical kernel duration; default to the selected tie window."""
-
-    network = section.get("network", {})
-    if not isinstance(network, Mapping):
-        raise ValueError("ginn_v3_body_inversion.network must be a mapping.")
-    samples = network.get("wavelet_samples")
-    duration = network.get("wavelet_duration_s")
-    if samples is not None and duration is not None:
-        raise ValueError("Specify wavelet_duration_s or wavelet_samples, rather than both.")
-    if samples is not None:
-        if isinstance(samples, bool) or int(samples) != samples or int(samples) < 3 or int(samples) % 2 == 0:
-            raise ValueError("network.wavelet_samples must be an odd integer of at least three samples.")
-        return int(samples)
-    step = float(sample_axis.step) if sample_axis.domain == "time" else float(infer_wavelet_dt(reference_time_s))
-    if duration is None:
-        duration = float(reference_time_s[-1] - reference_time_s[0])
-    if isinstance(duration, bool) or not np.isfinite(float(duration)) or float(duration) < 2.0 * step:
-        raise ValueError("network.wavelet_duration_s must be finite and cover at least two sample intervals.")
-    # Round inward: the free kernel must not exceed the requested duration.
-    half_samples = int(np.floor(float(duration) / (2.0 * step) + 1e-9))
-    return 2 * half_samples + 1
-
-
-def _canonical_wavelet(
-    reference_time_s: np.ndarray,
-    reference_amplitude: np.ndarray,
-    *,
-    sample_axis: Any,
-    wavelet_samples: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build the learned axis while retaining the complete independent QC reference."""
-
-    if getattr(sample_axis, "domain", None) == "time":
-        step = float(sample_axis.step)
-    else:
-        step = float(infer_wavelet_dt(reference_time_s))
-    center = int(wavelet_samples) // 2
-    learned_time = (np.arange(int(wavelet_samples), dtype=np.float64) - center) * step
-    return learned_time, reference_amplitude.copy()
-
-
 def _build_velocity(
     lfm: Any,
     section: Mapping[str, Any],
-    relation: AIVelocityRelation | None,
+    velocity_volume: str | Path | None = None,
 ) -> tuple[np.ndarray | None, str]:
-    if getattr(lfm.sample_axis, "domain", None) != "depth":
+    """Read a velocity volume or derive it from an independent AI--Vp relation."""
+    inputs = section["inputs"]
+    path_value = velocity_volume if velocity_volume is not None else inputs.get("velocity_volume")
+    relation_info = None if velocity_volume is not None else inputs.get("ai_velocity_relation")
+    if lfm.sample_axis.domain == "time":
+        if path_value is not None or relation_info is not None:
+            raise ValueError("Time inversion does not accept velocity_volume or ai_velocity_relation.")
         return None, "time_no_velocity"
-    inputs = section.get("inputs")
-    if not isinstance(inputs, Mapping):
-        raise ValueError("ginn_v3_body_inversion.inputs must be a mapping.")
-    path_value = inputs.get("velocity_volume")
+    if lfm.sample_axis.domain != "depth":
+        raise ValueError(f"Unsupported seismic domain: {lfm.sample_axis.domain!r}.")
+    if (path_value is None) == (relation_info is None):
+        raise ValueError("Depth inversion requires exactly one of velocity_volume and ai_velocity_relation.")
+    values = np.asarray(lfm.log_ai)
+    support = np.asarray(lfm.valid_mask, dtype=bool)
     if path_value is not None:
         path = resolve_relative_path(str(path_value), root=REPO_ROOT)
         velocity = np.asarray(np.load(path, mmap_mode="r", allow_pickle=False), dtype=np.float32)
-        if velocity.shape != np.asarray(lfm.log_ai).shape:
+        if velocity.shape != values.shape:
             raise ValueError("velocity_volume must match the complete LFM volume shape.")
-        if np.any(~np.isfinite(velocity)) or np.any(velocity <= 0.0):
-            raise ValueError("velocity_volume must contain finite positive values.")
+        if np.any(support & (~np.isfinite(velocity) | (velocity <= 0.0))):
+            raise ValueError("velocity_volume must be finite and positive on LFM support.")
         return velocity, "velocity_volume"
-    if relation is None:
-        raise ValueError("Depth PIAI requires an ai_velocity_relation or velocity_volume.")
-    values = np.asarray(lfm.log_ai)
-    valid = np.asarray(lfm.valid_mask, dtype=bool)
+    if not isinstance(relation_info, Mapping):
+        raise ValueError("inputs.ai_velocity_relation must be a unit-explicit relation mapping.")
+    relation = AIVelocityRelation.from_mapping(relation_info)
     velocity = np.full(values.shape, np.nan, dtype=np.float32)
     for start in range(0, values.shape[0], 8):
-        block_mask = valid[start:start + 8]
         block = values[start:start + 8]
+        block_mask = support[start:start + 8]
         converted = relation.velocity_from_ai(np.exp(block[block_mask].astype(np.float64)))
         if np.any(~np.isfinite(converted)) or np.any(converted <= 0.0):
             raise ValueError("The fixed AI-to-velocity relation produced invalid velocities.")
@@ -417,8 +317,9 @@ def _normalization_from(value: Any) -> Normalization:
 
 def _network_config(section: Mapping[str, Any], *, sample_count: int, wavelet_samples: int) -> NetworkConfig:
     value = section.get("network")
-    payload = dict(value or {}) if isinstance(value, Mapping) else {}
-    payload.pop("wavelet_duration_s", None)
+    if value is not None and not isinstance(value, Mapping):
+        raise ValueError("network must be a mapping.")
+    payload = dict(value or {})
     for key, expected in (("sample_count", sample_count), ("wavelet_samples", wavelet_samples)):
         if key in payload and int(payload[key]) != expected:
             raise ValueError(f"network.{key} must match the supplied data axis ({expected}).")
@@ -433,7 +334,9 @@ def _training_config(
     device: str | None,
 ) -> TrainingConfig:
     raw = section.get("training")
-    payload = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise ValueError("training must be a mapping.")
+    payload = dict(raw or {})
     if updates is not None:
         payload["updates"] = int(updates)
     if device is not None:
@@ -443,7 +346,9 @@ def _training_config(
 
 def _inference_config(section: Mapping[str, Any], *, batch_size: int | None) -> InferenceConfig:
     raw = section.get("inference")
-    payload = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise ValueError("inference must be a mapping.")
+    payload = dict(raw or {})
     if batch_size is not None:
         payload["batch_size"] = int(batch_size)
     return InferenceConfig.from_mapping(payload)
@@ -457,14 +362,15 @@ def _resolve_runtime(
     training_config: TrainingConfig,
     normalization: Normalization | None = None,
     expected_axis: Any | None = None,
-    expected_wavelet_samples: int | None = None,
+    kernel_time_s: np.ndarray | None = None,
 ) -> _Runtime:
     section = _section(raw)
+    wavelet_time_s = (
+        KernelConfig.from_mapping(section.get("kernel")).time_axis_s()
+        if kernel_time_s is None else np.asarray(kernel_time_s, dtype=np.float64).copy()
+    )
     workflow = WorkflowConfig.from_mapping(raw)
     lfm_run_dir, well_control_run_dir, variant_id = _resolve_inputs(section, overrides)
-    forward_source_dir = _resolve_forward_source(
-        section, domain=workflow.seismic.domain, overrides=overrides
-    )
     lfm = load_lfm_input(
         {
             "lfm_run_dir": str(lfm_run_dir),
@@ -499,24 +405,7 @@ def _resolve_runtime(
     if expected_axis is not None:
         _require_matching_axes(("checkpoint", expected_axis), ("survey", sample_axis))
 
-    reference_wavelet_time_s, reference_wavelet_amplitude_raw, relation, _wavelet_payload = _load_reference_wavelet(
-        forward_source_dir,
-        domain=workflow.seismic.domain,
-        depth_basis=workflow.seismic.depth_basis,
-        sample_axis=sample_axis,
-    )
-    selected_wavelet_samples = _configured_wavelet_samples(
-        section, reference_wavelet_time_s, sample_axis=sample_axis,
-    )
-    if expected_wavelet_samples is not None and selected_wavelet_samples != expected_wavelet_samples:
-        raise ValueError("Configured learned wavelet window differs from the checkpoint.")
-    wavelet_time_s, reference_wavelet_amplitude = _canonical_wavelet(
-        reference_wavelet_time_s,
-        reference_wavelet_amplitude_raw,
-        sample_axis=sample_axis,
-        wavelet_samples=selected_wavelet_samples,
-    )
-    velocity_mps, velocity_source = _build_velocity(lfm, section, relation)
+    velocity_mps, velocity_source = _build_velocity(lfm, section, overrides.velocity_volume)
     evaluation_supports = load_evaluation_support_for_run(
         well_control_run_dir, sample_axis=sample_axis, repo_root=REPO_ROOT
     )
@@ -546,7 +435,6 @@ def _resolve_runtime(
         config_path=config_path,
         lfm_run_dir=lfm_run_dir,
         well_control_run_dir=well_control_run_dir,
-        forward_source_dir=forward_source_dir,
         variant_id=variant_id,
         lfm=lfm,
         survey=survey,
@@ -557,11 +445,8 @@ def _resolve_runtime(
         data=data,
         physics=physics,
         wavelet_time_s=wavelet_time_s,
-        reference_wavelet_time_s=reference_wavelet_time_s,
-        reference_wavelet_amplitude=reference_wavelet_amplitude,
         normalization=runtime_normalization,
         velocity_mps=velocity_mps,
-        relation=relation,
         velocity_source=velocity_source,
         trusted_well_names=trusted_names,
     )
@@ -588,16 +473,11 @@ def _checkpoint_context(runtime: _Runtime, *, config_path: Path) -> dict[str, An
         "lfm_run_dir": repo_relative_path(runtime.lfm_run_dir, root=REPO_ROOT),
         "variant_id": runtime.variant_id,
         "well_control_run_dir": repo_relative_path(runtime.well_control_run_dir, root=REPO_ROOT),
-        "forward_source_dir": repo_relative_path(runtime.forward_source_dir, root=REPO_ROOT),
         "trusted_well_names": list(runtime.trusted_well_names),
         "sample_axis": {
             "domain": str(runtime.sample_axis.domain),
             "unit": str(runtime.sample_axis.unit),
             "values": _axis_values(runtime.sample_axis).tolist(),
-        },
-        "wavelet_reference": {
-            "time_s": runtime.reference_wavelet_time_s.tolist(),
-            "amplitude_raw": runtime.reference_wavelet_amplitude.tolist(),
         },
         "velocity_source": runtime.velocity_source,
     }
@@ -611,8 +491,7 @@ def train_body(
     lfm_run_dir: str | Path | None = None,
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
-    forward_model_inputs_run_dir: str | Path | None = None,
-    wavelet_generation_run_dir: str | Path | None = None,
+    velocity_volume: str | Path | None = None,
     trusted_well_names: Sequence[str] | None = None,
     device: str | None = None,
 ) -> TrainingResult:
@@ -625,8 +504,7 @@ def train_body(
         lfm_run_dir=None if lfm_run_dir is None else Path(lfm_run_dir),
         variant_id=variant_id,
         well_control_run_dir=None if well_control_run_dir is None else Path(well_control_run_dir),
-        forward_model_inputs_run_dir=None if forward_model_inputs_run_dir is None else Path(forward_model_inputs_run_dir),
-        wavelet_generation_run_dir=None if wavelet_generation_run_dir is None else Path(wavelet_generation_run_dir),
+        velocity_volume=None if velocity_volume is None else Path(velocity_volume),
         trusted_well_names=None if trusted_well_names is None else tuple(trusted_well_names),
         device=device,
     )
@@ -655,17 +533,17 @@ def train_body(
     write_json(
         output / "input_contract.json",
         {
-            "schema": "ginn_v3_piai_input_contract_v1",
+            "schema": "ginn_v3_piai_input_contract_v2",
             "config_path": repo_relative_path(resolved_config, root=REPO_ROOT),
             "sample_axis": runtime.sample_axis.describe(),
             "network": asdict(network_config),
             "training": asdict(training_config),
             "normalization": asdict(runtime.normalization),
             "trusted_well_names": list(runtime.trusted_well_names),
-            "source_reference_wavelet_time_s": runtime.reference_wavelet_time_s.tolist(),
             "learned_wavelet_time_s": runtime.wavelet_time_s.tolist(),
-            "reference_wavelet_time_s": runtime.reference_wavelet_time_s.tolist(),
-            "reference_wavelet_amplitude": runtime.reference_wavelet_amplitude.tolist(),
+            "kernel": asdict(KernelConfig.from_mapping(section.get("kernel"))),
+            "interface_alignment": "midpoint",
+            "velocity_source": runtime.velocity_source,
         },
     )
     trainer = JointTrainer(runtime.data, model, runtime.physics, training_config, logger=logger)
@@ -676,10 +554,8 @@ def train_body(
         runtime.data,
         runtime.physics,
         np.asarray(selected_payload["mean_wavelet_normalized"], dtype=np.float32),
-        runtime.reference_wavelet_amplitude,
         output / "well_qc",
         training_config.device,
-        reference_wavelet_time_s=runtime.reference_wavelet_time_s,
     )
     write_json(output / "well_qc" / "metrics.json", qc_metrics)
     return result
@@ -701,8 +577,7 @@ def load_body(
     lfm_run_dir: str | Path | None = None,
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
-    forward_model_inputs_run_dir: str | Path | None = None,
-    wavelet_generation_run_dir: str | Path | None = None,
+    velocity_volume: str | Path | None = None,
     trusted_well_names: Sequence[str] | None = None,
     batch_size: int | None = None,
     device: str | None = None,
@@ -751,8 +626,7 @@ def load_body(
         lfm_run_dir=None if lfm_run_dir is None else Path(lfm_run_dir),
         variant_id=variant_id,
         well_control_run_dir=None if well_control_run_dir is None else Path(well_control_run_dir),
-        forward_model_inputs_run_dir=None if forward_model_inputs_run_dir is None else Path(forward_model_inputs_run_dir),
-        wavelet_generation_run_dir=None if wavelet_generation_run_dir is None else Path(wavelet_generation_run_dir),
+        velocity_volume=None if velocity_volume is None else Path(velocity_volume),
         trusted_well_names=None if trusted_well_names is None else tuple(trusted_well_names),
         device=device,
         batch_size=batch_size,
@@ -764,12 +638,10 @@ def load_body(
         training_config=training_config,
         normalization=normalization,
         expected_axis=checkpoint_axis,
-        expected_wavelet_samples=model.config.wavelet_samples,
+        kernel_time_s=wavelet_time,
     )
     if model.config.sample_count != _axis_values(runtime.sample_axis).size:
         raise ValueError("Checkpoint model sample_count differs from the seismic SampleAxis.")
-    if not np.array_equal(runtime.wavelet_time_s, wavelet_time):
-        raise ValueError("Reference wavelet time axis differs from the checkpoint wavelet axis.")
     inference_config = _inference_config(section, batch_size=batch_size)
     return LoadedBody(
         checkpoint=checkpoint_path,
@@ -784,8 +656,6 @@ def load_body(
         model=model,
         physics=runtime.physics,
         normalization=runtime.normalization,
-        reference_wavelet_time_s=runtime.reference_wavelet_time_s,
-        reference_wavelet_amplitude=runtime.reference_wavelet_amplitude,
         inference_config=inference_config,
     )
 

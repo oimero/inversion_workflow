@@ -41,17 +41,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lfm-run-dir", type=Path, default=None)
     parser.add_argument("--variant-id", type=str, default=None)
     parser.add_argument("--well-control-run-dir", type=Path, default=None)
-    parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None)
-    parser.add_argument("--wavelet-generation-run-dir", type=Path, default=None)
+    parser.add_argument("--velocity-volume", type=Path, default=None)
     parser.add_argument("--trusted-well-name", action="append", dest="trusted_well_names", default=None)
     return parser.parse_args()
 
 
-def _resolve_output_dir(value: Path | None) -> Path:
+def _resolve_output_dir(value: Path | None, output_root: str | Path) -> Path:
     if value is not None:
         return resolve_relative_path(value, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return REPO_ROOT / "scripts" / "output" / f"ginn_v3_piai_infer_{timestamp}"
+    return resolve_relative_path(output_root, root=REPO_ROOT) / f"ginn_v3_piai_infer_{timestamp}"
 
 
 def main() -> None:
@@ -62,13 +61,12 @@ def main() -> None:
         lfm_run_dir=args.lfm_run_dir,
         variant_id=args.variant_id,
         well_control_run_dir=args.well_control_run_dir,
-        forward_model_inputs_run_dir=args.forward_model_inputs_run_dir,
-        wavelet_generation_run_dir=args.wavelet_generation_run_dir,
+        velocity_volume=args.velocity_volume,
         trusted_well_names=args.trusted_well_names,
         batch_size=args.batch_size,
         device=args.device,
     )
-    output_dir = _resolve_output_dir(args.output_dir)
+    output_dir = _resolve_output_dir(args.output_dir, loaded.workflow.output_root)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Inference output directory is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -101,11 +99,9 @@ def main() -> None:
         loaded.data,
         loaded.physics,
         result.wavelet_mean_normalized,
-        loaded.reference_wavelet_amplitude,
         well_qc_dir,
         next(loaded.model.parameters()).device,
         wavelet_cohort="predicted_volume_trace_mean",
-        reference_wavelet_time_s=loaded.reference_wavelet_time_s,
     )
     summary: dict[str, object] = {
         "schema": "ginn_v3_piai_inference_v1",
@@ -143,7 +139,7 @@ def main() -> None:
             source_seismic_file=seismic_path,
             source_seismic_type=workflow.seismic.type,
             sample_domain=workflow.seismic.domain,
-            title="物理约束神经网络反演",
+            title="Physics-constrained neural network inversion",
             details=["Unfiltered log-AI = LFM + raw network correction"],
             seismic_options=options,
         )

@@ -173,9 +173,9 @@ wavelet_batch_synthetic_depth:
 
 ---
 
-## 旁路：深度域正演输入冻结
+## 旁路：深度域第六步正演输入冻结
 
-这一步将岩石物理分析的声阻抗—纵波速度关系与第四步的固定子波组装为统一正演输入，供井控质检、深度域合成基准和物理约束神经网络反演读取。
+这一步将岩石物理分析的声阻抗—纵波速度关系与第四步的固定子波组装为统一正演输入，供第六步井控质检和深度域合成基准读取。
 
 岩石物理分析和子波提取各自独立重跑，本旁路只在子波或关系发生变化时才需要重跑，避免更新子波时必须重跑整个岩石物理拟合。
 
@@ -244,6 +244,8 @@ real_field_well_controls_qc:
   forward_model_inputs_run_dir: "<forward-input-run-dir>"
   dynamic_correlation_window_m: 75.0
 ```
+
+这里的 `forward_model_inputs_run_dir` 属于第六步质检段；第八步使用本页后面的速度来源配置。
 
 源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。质检配置中的动态相关窗口需填写正数。
 
@@ -319,28 +321,43 @@ real_field_lfm:
 
 ## 第 8 步：深度域物理约束神经网络反演
 
-第八步读取深度域井控、低频模型和固定正演输入，在每条道上联合学习对数阻抗修正与卷积核。预测阻抗由低频模型与网络修正直接相加，第六步固定评价支撑用于井目标和波形质检。网络方法、联合损失和产物说明见[第八步主教程](8-ginn.md)。
+第八步读取深度域地震、井控和低频模型，在每条道上联合学习对数阻抗修正与卷积核。预测阻抗由低频模型与网络修正直接相加，第六步固定评价支撑用于井目标和波形质检。网络方法、联合损失和产物说明见[第八步主教程](8-ginn.md)。
 
 ```powershell
 python scripts/piai_train.py --config "<inversion-config-yaml>" --output-dir "<training-output-dir>"
 ```
 
-训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir`、`--forward-model-inputs-run-dir`、`--trusted-well-name`、`--updates` 和 `--device` 覆盖对应配置。
+训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir`、`--velocity-volume`、`--trusted-well-name`、`--updates` 和 `--device` 覆盖对应配置。
 
 在第八步配置中，将上游输入指向本次深度域成果：
 
 ```yaml
 ginn_v3_body_inversion:
+  kernel:
+    dt_s: 0.002
+    duration_s: 0.2
   inputs:
     lfm_run_dir: "<lfm-run-dir>"
     variant_id: "<lfm-variant-id>"
     well_control_run_dir: "<well-control-run-dir>"
-    forward_model_inputs_run_dir: "<forward-input-run-dir>"
+    ai_velocity_relation:
+      formula: AI = a * Vp + b
+      a: <ai-vp-slope>
+      b: <ai-vp-intercept>
+      ai_unit: m/s*g/cm3
+      vp_unit: m/s
+      a_unit: g/cm3
+      b_unit: m/s*g/cm3
   trusted_well_names:
     - "<trusted-well-a>"
     - "<trusted-well-b>"
   network:
-    wavelet_duration_s: <learned-kernel-duration-s>  # 与 wavelet_samples 二选一
+    tcn_channels: [16, 16, 16]
+    hidden_channels: 32
+    kernel_size: 3
+    dilation: 2
+    gru_layers: 3
+    dropout: 0.0
   training:
     updates: 1000
     labeled_batch_size: 6
@@ -355,18 +372,20 @@ ginn_v3_body_inversion:
       cross: 1.0
 ```
 
-训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。固定正演输入提供参考子波及声阻抗—纵波速度关系，速度由该关系和初始阻抗一次计算；也可以通过 `inputs.velocity_volume` 提供与初模同形状的完整正速度体。训练与推理使用固定速度，把反射位置映射到双程旅行时后进行正演。
+训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。深度域速度来源在 `inputs.velocity_volume` 与 `inputs.ai_velocity_relation` 中二选一：速度体需要与低频模型同形状，并在低频模型有效支撑内保持有限且为正；关系映射使用完整的规范字段，由低频模型的线性声阻抗计算速度。训练与推理使用固定速度，把反射位置映射到双程旅行时后进行正演。
 
-地震、低频模型和井控的纵向采样轴以米表示，卷积核的相对时间轴以秒表示。深度正演的时间采样间隔来自参考子波，学习卷积核的窗口由网络配置确定。
+地震、低频模型和井控的纵向采样轴以米表示，卷积核的相对时间轴以秒表示。正演在相邻阻抗样点的中点界面上放置反射事件，按双程旅行时计算界面时间，并在秒单位上对学习卷积核做线性插值。卷积核时间间隔由本步显式配置，独立于深度体的米制采样间隔。
 
 | 配置 | 深度域语义 |
 |------|------------|
-| `forward_model_inputs_run_dir` | 本篇旁路生成的正演输入目录，包含固定子波和 AI–Vp 关系 |
-| 学习卷积核窗口 | 二选一填写总物理时长或奇数样点数；总时长按采样间隔向内取整为奇数点。参考子波质检保留完整原始时间轴 |
+| `kernel.dt_s` | 学习卷积核的时间采样间隔，单位为秒 |
+| `kernel.duration_s` / `kernel.samples` | 学习卷积核窗口；总时长和奇数样点数二选一 |
+| `inputs.velocity_volume` | 完整速度体路径，与低频模型同形状 |
+| `inputs.ai_velocity_relation` | 内联 AI–Vp 关系，包含 `formula`、`a`、`b`、`ai_unit`、`vp_unit`、`a_unit` 和 `b_unit` |
 | `validation_gap_m` | 平面空间验证块与训练区之间的米制间隔 |
-| `min_support_samples` | 参与训练和评价的最小连续支撑样点数 |
+| `min_support_samples` | 参与训练和评价的最少有效样点数 |
 
-井控、低频模型和地震的深度轴、线网及空间几何需要一致，平面验证间隔以米表示。训练使用井阻抗监督、预测正演与批间卷积核交换三项联合损失。训练完成后生成检查点、平均学习卷积核和井曲线质检；体预测由独立入口执行。
+井控、低频模型和地震的深度轴、线网及空间几何需要一致，平面验证间隔以米表示。训练使用井阻抗监督、预测正演与批间卷积核交换三项联合损失。训练完成后生成检查点、平均学习卷积核、井曲线和数值质检结果；体预测由独立入口执行。第四、第五步的固定子波仍属于深度域井震标定和批量合成链路，第八步的学习卷积核由本段 `kernel` 配置独立确定。
 
 ---
 
@@ -374,4 +393,4 @@ ginn_v3_body_inversion:
 
 前三步为两种域共享的井数据准备。时间域第四、第五步依次完成全井标定和共识子波生成；深度域第四、第五步依次完成固定子波提取和批量深度平移。两条路径的滤波测井成果分别进入第六步井控集，再用于第七步真实工区低频模型和第八步物理约束神经网络反演。
 
-岩石物理分析从第三步测井出发，与深度域第四步的参考子波共同组成固定正演输入。深度域第六步质检、合成基准与神经网络反演共享这份输入。
+岩石物理分析从第三步测井出发，与深度域第四步的固定子波共同组成第六步质检和合成基准使用的正演输入。第八步沿用深度域的井控与低频模型，并在本段配置速度来源和学习卷积核。

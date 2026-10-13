@@ -239,30 +239,35 @@ real_field_well_controls:
   source_run_type: wavelet_batch_synthetic_depth
   source_run_dir: "<batch-run-dir>"
   well_inventory_file: "<well-inventory-csv>"
-
-real_field_well_controls_qc:
-  forward_model_inputs_run_dir: "<forward-input-run-dir>"
-  dynamic_correlation_window_m: 75.0
+  qc:
+    forward_model_inputs_run_dir: "<forward-input-run-dir>"
+    body_smoothing_fwhm_m: 25.0
+    dynamic_correlation_window_m: 75.0
+    event_threshold_fraction: 0.1
+    max_event_windows_per_well: 4
 ```
 
-这里的 `forward_model_inputs_run_dir` 属于第六步质检段；第八步使用本页后面的速度来源配置。
+质检子段提供固定正演输入、主体平滑尺度、局部相关窗口和事件窗口筛选参数；第八步的速度来源按后文单独配置。
 
-源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。质检配置中的动态相关窗口需填写正数。
+源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。`body_smoothing_fwhm_m` 表示高斯核的半高全宽，`dynamic_correlation_window_m` 表示局部相关窗口长度，二者均按米填写并取正值。`event_threshold_fraction` 大于 0 且不超过 1，`max_event_windows_per_well` 为正整数。
 
 ### 脚本在做什么
 
 1. **读取成功井的滤波曲线。** 根据第五步汇总表选择成功井，读取平移后的滤波声阻抗，并保留原生测井轴上的曲线与有效性信息。
 2. **转换井深与位置。** 直井采用补心高程换算垂深并使用井口位置；斜井沿轨迹将测深转换为海平面以下垂深和平面位置。
 3. **对齐到地震深度轴。** 在连续有效曲线段内插值到地震的规则深度样点，保存每个样点的井位置和有效性，写出逐井数据与汇总清单。
-4. **执行单套正演质检。** 在目标层段内，直接对第五步输出的每口井已标定滤波阻抗做深度正演，使用统一正演输入和固定第六步评价支撑，计算整体与局部波形相似度。
-5. **写出固定评价支撑。** 将目标层位、原生曲线、模型轴曲线、真实地震和单套正演的共同有限区间写入评价支撑清单，供后续井标签和波形质检使用。
+4. **构造主体平滑曲线。** 在每口井的连续有效段内，对对数阻抗做按深度距离定义的高斯平滑，形成用于主体波形质检的临时曲线；井控文件保留上游已标定滤波曲线。
+5. **执行正演与波形比较。** 使用正演输入中的参考子波和阻抗—速度关系分别对滤波曲线与主体平滑曲线正演，在同一评价区间使用同一振幅增益比较整体波形，并按动态窗口计算局部相关性。
+6. **筛选事件窗口并写出固定评价支撑。** 按事件振幅阈值和每井窗口数量上限整理局部比较结果；评价支撑由滤波曲线的基础正演确定，主体平滑曲线需要完整覆盖同一区间。
 
 ### 质检输出
 
 | 文件 | 内容 |
 |---|---|
-| `qc/figures/<well>/full_waveform_qc.png` | 已标定滤波阻抗的单套正演对比 |
-| `qc/metrics.csv` | 每井固定评价支撑、共享增益和正演相关系数 |
+| `qc/figures/<well>/full_waveform_qc.png` | 已标定滤波阻抗的基础正演对比 |
+| `qc/figures/<well>/body_waveform_qc.png` | 滤波曲线与主体平滑曲线在同一评价区间、同一振幅增益下的正演对比 |
+| `qc/figures/<well>/event_waveform_comparison.png` | 事件窗口中的局部波形比较 |
+| `qc/metrics.csv` | 每井固定评价支撑、共享增益、两套正演相关系数、相关性变化、误差、振幅比例和事件窗口统计 |
 | `qc/evaluation_support.json` | 每井固定评价支撑的轴区间和样点索引 |
 | `qc/manifest.json` | 质检参数、来源和图件路径 |
 

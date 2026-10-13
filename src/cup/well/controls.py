@@ -37,6 +37,7 @@ from cup.well.evaluation_support import (
     write_evaluation_support_manifest,
 )
 from cup.well.inventory import build_file_lookup, normalize_well_name
+from cup.well.scale import gaussian_smooth_finite_runs_numpy
 from cup.well.tie import DEPTH_WAVELET_BATCH_SCHEMA_VERSION, WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.well.trajectory import WellTrajectory, load_workflow_time_depth_table_csv
 from wtie.optimize.similarity import normalized_xcorr
@@ -1206,7 +1207,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         provenance=provenance,
     )
 
-QC_SCHEMA_VERSION = "real_field_well_control_qc_v2"
+QC_SCHEMA_VERSION = "real_field_well_control_qc_v3"
 
 
 def _safe_corr(first: np.ndarray, second: np.ndarray) -> float:
@@ -1454,6 +1455,98 @@ def _waveform_objects(
     return linear_ai, reflectivity, synthetic_trace, real_trace, xcorr, dynamic
 
 
+def _event_windows(
+    seismic: np.ndarray,
+    *,
+    threshold_fraction: float,
+    maximum: int,
+) -> list[tuple[int, int]]:
+    values = np.asarray(seismic, dtype=np.float64)
+    centered = values - np.median(values)
+    sign = np.sign(centered)
+    for index in range(1, sign.size):
+        if sign[index] == 0.0:
+            sign[index] = sign[index - 1]
+    if sign[0] == 0.0:
+        nonzero = np.flatnonzero(sign)
+        sign[: nonzero[0] if nonzero.size else sign.size] = sign[nonzero[0]] if nonzero.size else 1.0
+    changes = np.r_[True, sign[1:] != sign[:-1], True]
+    runs = np.flatnonzero(changes)
+    threshold = float(threshold_fraction) * float(np.percentile(np.abs(centered), 95.0))
+    scored: list[tuple[float, int, int]] = []
+    for start, stop in zip(runs[:-1], runs[1:]):
+        if stop - start < 2:
+            continue
+        score = float(np.max(np.abs(centered[start:stop])))
+        if score >= threshold:
+            scored.append((score, int(start), int(stop)))
+    selected = sorted(scored, reverse=True)[:maximum]
+    return sorted((start, stop) for _score, start, stop in selected)
+
+
+def _plot_event_comparison(
+    *,
+    output_path: Path,
+    well_name: str,
+    axis: np.ndarray,
+    model_grid_filtered_log_ai: np.ndarray,
+    body_log_ai: np.ndarray,
+    real: np.ndarray,
+    full_synthetic: np.ndarray,
+    body_synthetic: np.ndarray,
+    body_fwhm_m: float,
+    threshold_fraction: float,
+    maximum_events: int,
+) -> int:
+    events = _event_windows(real, threshold_fraction=threshold_fraction, maximum=maximum_events)
+    if not events:
+        raise ValueError(f"{well_name}: no target-interval waveform events passed the threshold.")
+    fig, axes = plt.subplots(
+        len(events), 4, figsize=(14.5, max(3.2, 2.6 * len(events))),
+        squeeze=False, constrained_layout=True,
+    )
+    for row, (event_start, event_stop) in enumerate(events):
+        pad = max(3, event_stop - event_start)
+        local = slice(max(0, event_start - pad), min(axis.size, event_stop + pad))
+        local_axis = axis[local]
+        axes[row, 0].plot(real[local], local_axis, color="black", lw=1.5)
+        axes[row, 0].axhspan(axis[event_start], axis[event_stop - 1], color="tab:blue", alpha=0.12)
+        axes[row, 0].set_title("Real seismic" if row == 0 else "")
+        axes[row, 1].plot(
+            model_grid_filtered_log_ai[local], local_axis, color="black", lw=1.1, label="filtered",
+        )
+        axes[row, 1].plot(
+            body_log_ai[local], local_axis, color="tab:red", lw=1.5,
+            label=f"body, FWHM {body_fwhm_m:g} m",
+        )
+        axes[row, 1].set_title("log-AI" if row == 0 else "")
+        axes[row, 2].plot(
+            model_grid_filtered_log_ai[local] - body_log_ai[local], local_axis,
+            color="tab:purple", lw=1.2, label="filtered - body",
+        )
+        axes[row, 2].axvline(0.0, color="black", lw=0.8, alpha=0.6)
+        axes[row, 2].set_title("log-AI residual" if row == 0 else "")
+        axes[row, 3].plot(
+            full_synthetic[local], local_axis, color="tab:blue", lw=1.2, label="filtered forward",
+        )
+        axes[row, 3].plot(
+            body_synthetic[local], local_axis, color="tab:orange", lw=1.2, label="body forward",
+        )
+        axes[row, 3].set_title("Shared-gain synthetic" if row == 0 else "")
+        if row == 0:
+            for column in (1, 2, 3):
+                axes[row, column].legend(fontsize=8)
+        for column in range(4):
+            axes[row, column].set_ylim(float(local_axis[-1]), float(local_axis[0]))
+            axes[row, column].grid(alpha=0.2)
+            axes[row, column].set_ylabel("TVDSS [m]" if column == 0 else "")
+    fig.suptitle(f"{well_name} | filtered/body waveform slices | FWHM {body_fwhm_m:g} m")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return len(events)
+
+
 def write_depth_well_control_qc(
     control_set: WellControlSet,
     *,
@@ -1466,13 +1559,25 @@ def write_depth_well_control_qc(
 ) -> dict[str, Any]:
     """Write the target-interval QC figures for every successful Step 6 well."""
 
-    expected = {"dynamic_correlation_window_m"}
+    expected = {
+        "body_smoothing_fwhm_m", "dynamic_correlation_window_m",
+        "event_threshold_fraction", "max_event_windows_per_well",
+    }
     if set(config) != expected:
-        raise ValueError(f"real_field_well_controls_qc must contain exactly {sorted(expected)}.")
+        raise ValueError(f"real_field_well_controls.qc must contain exactly {sorted(expected)}.")
     if control_set.sample_domain != "depth" or control_set.depth_basis != "tvdss":
         raise ValueError("Current Step 6 forward QC requires depth/TVDSS well controls.")
+    if any(isinstance(config[key], (bool, np.bool_)) for key in expected):
+        raise ValueError("Step 6 QC numeric settings cannot be boolean.")
+    body_fwhm = float(config["body_smoothing_fwhm_m"])
     dynamic_window = float(config["dynamic_correlation_window_m"])
-    if not np.isfinite(dynamic_window) or dynamic_window <= 0.0:
+    threshold_fraction = float(config["event_threshold_fraction"])
+    maximum_events = config["max_event_windows_per_well"]
+    if (
+        not np.all(np.isfinite([body_fwhm, dynamic_window, threshold_fraction]))
+        or body_fwhm <= 0.0 or dynamic_window <= 0.0 or not 0.0 < threshold_fraction <= 1.0
+        or not isinstance(maximum_events, (int, np.integer)) or maximum_events < 1
+    ):
         raise ValueError("Step 6 QC numeric settings are invalid.")
     wavelet_time, wavelet_amp, relation_a, relation_b, forward_inputs_path = (
         load_depth_forward_inputs(forward_inputs_run_dir, repo_root=repo_root)
@@ -1487,6 +1592,9 @@ def write_depth_well_control_qc(
         well_dir.mkdir()
         axis = control.sample_axis.values
         model_grid_filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
+        body_log_ai = gaussian_smooth_finite_runs_numpy(
+            model_grid_filtered_log_ai, axis, fwhm_m=body_fwhm,
+        )
         real = sample_seismic_along_control(control, survey)
         full_forward = forward_depth_finite_runs(
             model_grid_filtered_log_ai,
@@ -1495,6 +1603,11 @@ def write_depth_well_control_qc(
             wavelet_amplitude=wavelet_amp,
             relation_a=relation_a,
             relation_b=relation_b,
+        )
+        body_forward = forward_depth_finite_runs(
+            body_log_ai, axis,
+            wavelet_time_s=wavelet_time, wavelet_amplitude=wavelet_amp,
+            relation_a=relation_a, relation_b=relation_b,
         )
         markers = horizon_markers_along_control(control, target_zone)
         support = build_evaluation_support(
@@ -1509,6 +1622,8 @@ def write_depth_well_control_qc(
         )
         evaluation_supports[control.well_name] = support
         selected = slice(support.start_index, support.stop_index)
+        if np.any(~np.isfinite(body_forward[selected])):
+            raise ValueError(f"{control.well_name}: body forward does not cover the baseline evaluation support.")
         support_fraction = support.support_fraction
         local_axis = axis[selected]
         local_real = real[selected]
@@ -1517,14 +1632,15 @@ def write_depth_well_control_qc(
             raise ValueError(f"{control.well_name}: target seismic has zero variance.")
         local_real = (local_real - float(np.mean(local_real))) / real_std
         local_full_forward = full_forward[selected]
+        local_body_forward = body_forward[selected]
         denominator = float(np.dot(local_full_forward, local_full_forward))
-        signed_gain = (
-            float(np.dot(local_real, local_full_forward) / denominator)
-            if denominator > 0.0
-            else 1.0
-        )
+        if not np.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError(f"{control.well_name}: baseline synthetic has no positive finite energy.")
+        signed_gain = float(np.dot(local_real, local_full_forward) / denominator)
         gain = abs(signed_gain)
+        body_to_full_rms = float(np.sqrt(np.dot(local_body_forward, local_body_forward) / denominator))
         local_full_forward = gain * local_full_forward
+        local_body_forward = gain * local_body_forward
         local_markers = [item for item in markers if local_axis[0] <= item[0] <= local_axis[-1]]
 
         full_objects = _waveform_objects(
@@ -1552,6 +1668,30 @@ def write_depth_well_control_qc(
         fig.savefig(full_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
 
+        body_objects = _waveform_objects(
+            axis=local_axis, log_ai=body_log_ai[selected],
+            synthetic=local_body_forward, real=local_real,
+            dynamic_window_axis_units=dynamic_window, name=f"Body AI, FWHM {body_fwhm:g} m",
+        )
+        body_corr = _safe_corr(local_real, local_body_forward)
+        fig, _ = plot_well_waveform_qc(
+            [body_objects[0]], *body_objects[1:], figsize=(13.0, 7.5),
+            synthetic_ai=body_objects[0],
+            title=f"Step 6 body forward QC | {control.well_name} | FWHM {body_fwhm:g} m | corr={body_corr:.3f}",
+            horizon_markers=local_markers,
+        )
+        body_path = well_dir / "body_waveform_qc.png"
+        fig.savefig(body_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        comparison_path = well_dir / "event_waveform_comparison.png"
+        event_count = _plot_event_comparison(
+            output_path=comparison_path, well_name=control.well_name, axis=local_axis,
+            model_grid_filtered_log_ai=model_grid_filtered_log_ai[selected],
+            body_log_ai=body_log_ai[selected], real=local_real,
+            full_synthetic=local_full_forward, body_synthetic=local_body_forward,
+            body_fwhm_m=body_fwhm, threshold_fraction=threshold_fraction,
+            maximum_events=maximum_events,
+        )
         rows.append(
             {
                 "well_name": control.well_name,
@@ -1567,7 +1707,16 @@ def write_depth_well_control_qc(
                 "shared_forward_gain": gain,
                 "signed_forward_gain": signed_gain,
                 "full_forward_correlation": full_corr,
+                "body_smoothing_fwhm_m": body_fwhm,
+                "body_forward_correlation": body_corr,
+                "body_forward_correlation_change": body_corr - full_corr,
+                "full_forward_mse": float(np.mean(np.square(local_full_forward - local_real))),
+                "body_forward_mse": float(np.mean(np.square(local_body_forward - local_real))),
+                "body_to_full_forward_rms_ratio": body_to_full_rms,
+                "event_window_count": event_count,
                 "full_waveform_qc": repo_relative_path(full_path, root=repo_root),
+                "body_waveform_qc": repo_relative_path(body_path, root=repo_root),
+                "event_waveform_comparison": repo_relative_path(comparison_path, root=repo_root),
             }
         )
 
@@ -1578,7 +1727,7 @@ def write_depth_well_control_qc(
         support_path,
         sample_axis=control_set.sample_axis,
         supports=evaluation_supports,
-        source="real_field_well_controls_qc",
+        source="real_field_well_controls.qc",
     )
     manifest = {
         "schema_version": QC_SCHEMA_VERSION,

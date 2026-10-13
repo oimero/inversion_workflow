@@ -14,7 +14,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -107,6 +107,7 @@ def _resolved_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str,
     config = dict(raw.get("real_field_well_controls") or {})
     if not config:
         raise ValueError("Config lacks real_field_well_controls section.")
+    config.pop("qc", None)
     config["source_run_dir"] = str(_resolve_source_run(config, workflow))
     inventory_value = str(config.get("well_inventory_file") or "").strip()
     if inventory_value:
@@ -126,9 +127,11 @@ def _resolved_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str,
 
 
 def _resolve_forward_inputs_run(raw: dict[str, Any], workflow: WorkflowConfig) -> tuple[Path, dict[str, Any]]:
-    config = dict(raw.get("real_field_well_controls_qc") or {})
-    if not config:
-        raise ValueError("Config lacks real_field_well_controls_qc section.")
+    section = raw.get("real_field_well_controls")
+    qc = section.get("qc") if isinstance(section, Mapping) else None
+    if not isinstance(qc, Mapping) or not qc:
+        raise ValueError("Config requires a real_field_well_controls.qc mapping.")
+    config = dict(qc)
     explicit = str(config.pop("forward_model_inputs_run_dir", "") or "").strip()
     if explicit:
         run_dir = resolve_relative_path(explicit, root=REPO_ROOT)

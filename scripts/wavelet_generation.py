@@ -16,7 +16,6 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -37,7 +36,6 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig, load_workflow_config, merge_dict_defaults
 from cup.config.sources import resolve_source_run
 from cup.utils.io import (
-    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
@@ -46,7 +44,8 @@ from cup.utils.io import (
 from cup.seismic.wavelet_consensus import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.well.inventory import normalize_well_name
-from cup.well.tie import (
+from cup.well.wavelet_generation import (
+    PreparedWellEvaluation,
     TieEvaluationWell,
     WaveletCandidate,
     WaveletWellMetric,
@@ -54,8 +53,6 @@ from cup.well.tie import (
     evaluate_wavelet_on_well,
     load_tie_artifacts,
     prepare_well_for_evaluation,
-    prepare_depth_tie_sampling,
-    map_time_qc_to_depth,
 )
 from cup.seismic.wavelet import (
     infer_wavelet_dt,
@@ -66,7 +63,6 @@ from cup.seismic.wavelet import (
 )
 from cup.seismic.wavelet_consensus import WAVELET_GENERATION_SCHEMA_VERSION, ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
 from wtie.modeling.modeling import ConvModeler
-from wtie.optimize import tie as tie_ops
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
@@ -342,23 +338,6 @@ def _score_from_aggregate(row: pd.Series, cfg: dict[str, Any], *, regularization
     return float(score)
 
 
-def _prepare_well_for_evaluation_with_ai(
-    well: TieEvaluationWell,
-    *,
-    dt_s: float,
-) -> tuple[Any, Any, grid.Log]:
-    from cup.well.tie import load_continuous_tie_evaluation_inputs, resample_tie_seismic_to_dt
-
-    logset, table, seismic = load_continuous_tie_evaluation_inputs(well)
-    # 候选子波按提取器网格存储（例如 2 ms），第四步保存的地震道可能更粗（例如 4 ms）。
-    seismic = resample_tie_seismic_to_dt(seismic, dt_s)
-    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, dt_s)
-    reflectivity = tie_ops.compute_reflectivity(logset_twt)
-    seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
-    ai_values = np.interp(seismic_match.basis, logset_twt.AI.basis, logset_twt.AI.values, left=np.nan, right=np.nan)
-    return seismic_match, reflectivity_match, grid.Log(ai_values, seismic_match.basis, "twt", name="AI")
-
-
 def _evaluate_wavelet_on_all_wells(
     *,
     wavelet_name: str,
@@ -369,7 +348,7 @@ def _evaluate_wavelet_on_all_wells(
     clusters_df: pd.DataFrame,
     modeler: Any,
     output_qc_dir: Path | None = None,
-    well_cache: dict[str, tuple[Any, ...]] | None = None,
+    well_cache: dict[str, PreparedWellEvaluation] | None = None,
 ) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
     metrics: list[WaveletWellMetric] = []
     qcs: list[pd.DataFrame] = []
@@ -384,18 +363,9 @@ def _evaluate_wavelet_on_all_wells(
                 candidate_wavelet=wavelet_name,
                 source_well=source_well,
                 modeler=modeler,
-                seismic_match=precomputed[0] if precomputed is not None else None,
-                reflectivity_match=precomputed[1] if precomputed is not None else None,
+                prepared=precomputed,
             )
             qc = qc.copy()
-            if precomputed is not None and len(precomputed) >= 3:
-                qc["ai"] = precomputed[2].values
-            if well.sample_domain == "depth":
-                sampling = precomputed[3] if precomputed is not None and len(precomputed) > 3 else prepare_depth_tie_sampling(well, qc.twt_s.to_numpy())
-                qc, depth_metrics = map_time_qc_to_depth(qc, sampling)
-                metric = replace(metric, corr=depth_metrics["corr"], nmae=depth_metrics["nmae"],
-                                 scale=float(metric.scale)*depth_metrics["scale_multiplier"],
-                                 n_eval_samples=depth_metrics["n_eval_samples"])
             metrics.append(metric)
             qc.insert(0, "well_name", well.well_name)
             qc.insert(1, "candidate_wavelet", wavelet_name)
@@ -662,14 +632,10 @@ def main() -> None:
 
     modeler = ConvModeler()
     wavelet_dt_s = infer_wavelet_dt(wavelet_time_s)
-    well_cache: dict[str, tuple[Any, ...]] = {
-        normalize_well_name(well.well_name): _prepare_well_for_evaluation_with_ai(well, dt_s=wavelet_dt_s)
+    well_cache: dict[str, PreparedWellEvaluation] = {
+        normalize_well_name(well.well_name): prepare_well_for_evaluation(well, dt_s=wavelet_dt_s)
         for well in wells
     }
-    if workflow.seismic.domain == "depth":
-        well_cache = {normalize_well_name(well.well_name): (*well_cache[normalize_well_name(well.well_name)],
-                      prepare_depth_tie_sampling(well, well_cache[normalize_well_name(well.well_name)][0].basis))
-                      for well in wells}
     candidate_metric_frames = []
     for item in pool:
         metrics_df, _ = _evaluate_wavelet_on_all_wells(

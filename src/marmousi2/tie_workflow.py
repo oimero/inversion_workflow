@@ -17,21 +17,19 @@ import pandas as pd
 import yaml
 
 from cup.utils.io import repo_relative_path, write_json
-from cup.well.pretrained import resolve_wtie_asset
 from cup.well.tie import (
-    TieEvaluationWell,
     WellTiePlan,
     prepare_continuous_tie_logs,
-    prepare_well_for_evaluation,
-    results_dataframe,
     WELL_AUTO_TIE_SCHEMA_VERSION,
     scaled_synthetic_metrics,
 )
+from cup.well.wavelet_generation import prepare_well_for_evaluation
 from cup.well.trajectory import write_time_depth_table_csv
 from cup.well.tie import WellTieResult
-from cup.well.auto_tie import ensure_output_dirs, output_paths
-from cup.well.auto_tie import run_fixed_tie
-from cup.well.auto_tie import load_wavelet_extractor, write_wavelet_inventory
+from cup.well.auto_tie import (
+    ensure_output_dirs, output_paths, run_fixed_tie, results_dataframe,
+    load_wavelet_extractor, write_wavelet_inventory, resolve_wtie_asset,
+)
 from cup.well.las import load_standard_vp_rho_logs
 from cup.well.trajectory import PreparedTieWindow
 from cup.seismic.wavelet import crop_wavelet_center_energy_normalize, wavelet_l2_normalize
@@ -384,7 +382,7 @@ def _network_wavelet_consensus(
         build_wavelet_pca_basis,
         optimize_consensus_wavelet,
     )
-    from cup.well.tie import (
+    from cup.well.wavelet_generation import (
         evaluate_wavelet_on_well,
         load_tie_artifacts,
     )
@@ -413,7 +411,6 @@ def _network_wavelet_consensus(
     def score_wavelet(values: np.ndarray, *, candidate_name: str) -> tuple[dict[str, object], list[dict[str, object]]]:
         metric_rows: list[dict[str, object]] = []
         for well in wells:
-            seismic_match, reflectivity_match = well_cache[well.well_name]
             metric, _qc = evaluate_wavelet_on_well(
                 wavelet_time_s=wavelet_time,
                 wavelet_amplitude=values,
@@ -421,8 +418,7 @@ def _network_wavelet_consensus(
                 candidate_wavelet=candidate_name,
                 source_well=candidate_name,
                 modeler=modeler,
-                seismic_match=seismic_match,
-                reflectivity_match=reflectivity_match,
+                prepared=well_cache[well.well_name],
             )
             metric_rows.append(metric.to_row())
         frame = pd.DataFrame.from_records(metric_rows)

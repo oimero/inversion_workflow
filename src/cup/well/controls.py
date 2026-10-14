@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -37,11 +38,13 @@ from cup.well.evaluation_support import (
     write_evaluation_support_manifest,
 )
 from cup.well.inventory import build_file_lookup, normalize_well_name
-from cup.well.scale import gaussian_smooth_finite_runs_numpy
 from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.well.trajectory import WellTrajectory, load_workflow_time_depth_table_csv
 from wtie.optimize.similarity import normalized_xcorr
 from wtie.processing import grid
+
+_FWHM_TO_SIGMA = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+_GAUSSIAN_TRUNCATE_SIGMA = 8.0
 
 # Data contracts
 
@@ -1245,6 +1248,103 @@ def _waveform_objects(
     return linear_ai, reflectivity, synthetic_trace, real_trace, xcorr, dynamic
 
 
+def _validate_gaussian_inputs(
+    values: Any,
+    coordinates: Any,
+    fwhm: float,
+) -> tuple[np.ndarray, np.ndarray, float, bool]:
+    """Validate values and physical coordinates for Gaussian body smoothing."""
+
+    array = np.asarray(values)
+    coordinate_array = np.asarray(coordinates)
+    if not np.issubdtype(array.dtype, np.floating) or array.ndim < 1:
+        raise TypeError("values must be a floating array with shape [..., samples].")
+    if not np.issubdtype(coordinate_array.dtype, np.floating):
+        raise TypeError("coordinates must have a floating dtype.")
+    shared_coordinates = coordinate_array.ndim == 1
+    if shared_coordinates:
+        coordinate_array = np.broadcast_to(coordinate_array, array.shape)
+    if coordinate_array.shape != array.shape:
+        raise ValueError("coordinates must have shape (samples,) or match values.")
+    if np.any(~np.isfinite(array)) or np.any(~np.isfinite(coordinate_array)):
+        raise ValueError("values and coordinates must contain only finite values.")
+    flat_coordinates = coordinate_array.reshape((-1, coordinate_array.shape[-1]))
+    if np.any(np.diff(flat_coordinates, axis=-1) <= 0.0):
+        raise ValueError("coordinates must be strictly increasing along every trace.")
+    width = float(fwhm)
+    if not np.isfinite(width) or width <= 0.0:
+        raise ValueError("fwhm must be finite and positive.")
+    return array, coordinate_array, width, shared_coordinates
+
+
+def _gaussian_smooth(
+    values: Any,
+    coordinates: Any,
+    *,
+    fwhm: float,
+) -> np.ndarray:
+    """Apply a normalized Gaussian defined by physical coordinate distance."""
+
+    array, coordinate_array, width, shared_coordinates = _validate_gaussian_inputs(
+        values,
+        coordinates,
+        fwhm,
+    )
+    sigma = width * _FWHM_TO_SIGMA
+    flat_values = array.reshape((-1, array.shape[-1]))
+    flat_coordinates = coordinate_array.reshape((-1, coordinate_array.shape[-1]))
+    output = np.empty(flat_values.shape, dtype=np.result_type(array.dtype, np.float64))
+    radius = _GAUSSIAN_TRUNCATE_SIGMA * sigma
+    if shared_coordinates:
+        axis = flat_coordinates[0]
+        starts = np.searchsorted(axis, axis - radius, side="left")
+        stops = np.searchsorted(axis, axis + radius, side="right")
+        for index, (start, stop) in enumerate(zip(starts, stops)):
+            weights = np.exp(-0.5 * np.square((axis[start:stop] - axis[index]) / sigma))
+            weights /= np.sum(weights)
+            output[:, index] = flat_values[:, start:stop] @ weights
+    else:
+        for trace_index, (trace_values, axis) in enumerate(zip(flat_values, flat_coordinates)):
+            starts = np.searchsorted(axis, axis - radius, side="left")
+            stops = np.searchsorted(axis, axis + radius, side="right")
+            for sample_index, (start, stop) in enumerate(zip(starts, stops)):
+                weights = np.exp(
+                    -0.5 * np.square((axis[start:stop] - axis[sample_index]) / sigma)
+                )
+                weights /= np.sum(weights)
+                output[trace_index, sample_index] = trace_values[start:stop] @ weights
+    return output.reshape(array.shape).astype(array.dtype, copy=False)
+
+
+def _gaussian_smooth_finite_runs(
+    values: Any,
+    coordinates: Any,
+    *,
+    fwhm: float,
+) -> np.ndarray:
+    """Smooth contiguous finite runs without crossing missing-log gaps."""
+
+    array = np.asarray(values)
+    coordinate_array = np.asarray(coordinates)
+    if array.ndim != 1 or coordinate_array.shape != array.shape:
+        raise ValueError("finite-run smoothing requires matching one-dimensional arrays.")
+    if not np.issubdtype(array.dtype, np.floating) or not np.issubdtype(
+        coordinate_array.dtype,
+        np.floating,
+    ):
+        raise TypeError("values and coordinates must have floating dtypes.")
+    if np.any(~np.isfinite(coordinate_array)) or np.any(np.diff(coordinate_array) <= 0.0):
+        raise ValueError("coordinates must be finite and strictly increasing.")
+    output = np.full(array.shape, np.nan, dtype=array.dtype)
+    for start, stop in _finite_runs(np.isfinite(array)):
+        output[start:stop] = _gaussian_smooth(
+            array[start:stop],
+            coordinate_array[start:stop],
+            fwhm=fwhm,
+        )
+    return output
+
+
 def _event_windows(
     seismic: np.ndarray,
     *,
@@ -1382,8 +1482,8 @@ def write_depth_well_control_qc(
         well_dir.mkdir()
         axis = control.sample_axis.values
         model_grid_filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
-        body_log_ai = gaussian_smooth_finite_runs_numpy(
-            model_grid_filtered_log_ai, axis, fwhm_m=body_fwhm,
+        body_log_ai = _gaussian_smooth_finite_runs(
+            model_grid_filtered_log_ai, axis, fwhm=body_fwhm,
         )
         real = sample_seismic_along_control(control, survey)
         full_forward = forward_depth_finite_runs(
@@ -1666,7 +1766,7 @@ def write_well_control_qc(
         axis = control.sample_axis.values
         real = sample_seismic_along_control(control, survey)
         filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
-        body_log_ai = gaussian_smooth_finite_runs_numpy(filtered_log_ai, axis, fwhm_m=body_fwhm_s)
+        body_log_ai = _gaussian_smooth_finite_runs(filtered_log_ai, axis, fwhm=body_fwhm_s)
         full_forward = forward_time_finite_runs(
             filtered_log_ai,
             wavelet_time_s=wavelet_time,

@@ -12,9 +12,9 @@
 
 ::: cup.well.auto_tie
 
-::: cup.well.controls
+::: cup.well.wavelet_generation
 
-::: cup.well.scale
+::: cup.well.controls
 
 ::: cup.well.tie
 

@@ -7,9 +7,10 @@ mapping stays fixed while the well time-depth relation is optimized.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from numbers import Real
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 import warnings
 
 import numpy as np
@@ -25,12 +26,13 @@ from cup.seismic.trace_sampling import (
 )
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.coerce import as_bool
+from cup.utils.coerce import as_bool as _as_bool, optional_float as _optional_float
 from cup.utils.io import repo_relative_path, resolve_relative_path, sanitize_filename
 from cup.utils.masks import true_runs
-from cup.well.inventory import build_file_lookup
+from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.las import StandardVpRhoLogs, load_standard_vp_rho_logs
 from cup.well.tie import (
-    WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan,
+    WellTiePlan, WellTieResult, tie_text, well_rows_by_name,
     fill_short_joint_gaps, prepare_continuous_tie_logs, resample_tie_seismic_to_dt,
     scaled_synthetic_metrics,
 )
@@ -266,6 +268,201 @@ def compute_initial_metrics(logset_md: Any, seismic: Any, table: Any, wavelet: A
 
 
 # Well participation and route planning
+
+class TieRoute(str, Enum):
+    VERTICAL_WITH_TDT = "vertical_with_tdt"
+    VERTICAL_ANCHOR_FROM_TOPS = "vertical_anchor_from_tops"
+    DEVIATED_WITH_TDT = "deviated_with_tdt"
+    DEVIATED_ANCHOR_FROM_TOPS = "deviated_anchor_from_tops"
+    VERTICAL_LOCAL_DEPTH = "vertical_local_depth"
+    DEVIATED_LOCAL_DEPTH = "deviated_local_depth"
+    REJECTED = "rejected"
+
+
+def _path_for_lookup(lookup: Mapping[str, Path], well_name: str) -> str:
+    path = lookup.get(normalize_well_name(well_name))
+    return "" if path is None else Path(path).as_posix()
+
+
+def build_tie_plan(
+    *,
+    inventory_df: pd.DataFrame,
+    preprocess_df: pd.DataFrame,
+    trajectory_df: pd.DataFrame | None,
+    time_depth_lookup: Mapping[str, Path],
+    trace_lookup: Mapping[str, Path],
+    enabled_routes: Sequence[str],
+    allow_near_outside: bool = False,
+    sample_domain: str = "time",
+    well_roles: Mapping[str, str] | Callable[[str], str] | None = None,
+) -> list[WellTiePlan]:
+    """为清单中的每口井构建一行标定路由计划。
+
+    ``sample_domain`` only changes the asset needed to select a route.  Time
+    domain routes use an existing TDT, while depth-domain routes derive their
+    local TWT table from the well Vp during execution.  The planner still
+    records one row for every inventory well so role-based exclusions remain
+    visible in the plan.
+    """
+    domain = str(sample_domain).strip().casefold()
+    if domain not in {"time", "depth"}:
+        raise ValueError("sample_domain must be 'time' or 'depth'.")
+
+    def role_for(name: str) -> str:
+        if well_roles is None:
+            return "trusted"
+        value = well_roles(name) if callable(well_roles) else well_roles.get(name)
+        role = "trusted" if value is None else str(value).strip().casefold()
+        if role not in {"trusted", "background_only", "excluded"}:
+            raise ValueError(f"Unsupported well role for {name!r}: {value!r}.")
+        return role
+
+    preprocess_by_key = well_rows_by_name(preprocess_df)
+    trajectory_by_key = well_rows_by_name(trajectory_df if trajectory_df is not None else pd.DataFrame())
+    enabled = {str(route) for route in enabled_routes}
+    plans: list[WellTiePlan] = []
+
+    for _, inv in inventory_df.iterrows():
+        well_name = str(inv["well_name"])
+        key = normalize_well_name(well_name)
+        pre = preprocess_by_key.get(key)
+        traj = trajectory_by_key.get(key)
+
+        survey_position = tie_text(inv.get("survey_position"))
+        in_allowed_survey = survey_position == "inside" or (allow_near_outside and survey_position == "near_outside")
+        has_time_depth = _as_bool(inv.get("has_time_depth")) and key in time_depth_lookup
+        has_well_trace = _as_bool(inv.get("has_well_trace")) and key in trace_lookup
+        has_well_tops = _as_bool(inv.get("has_well_tops"))
+        usable_p = (
+            pre is not None
+            and _as_bool(pre.get("usable_p_sonic"))
+            and tie_text(pre.get("preprocess_status")) == "passed"
+        )
+        usable_rho = (
+            pre is not None
+            and _as_bool(pre.get("usable_density"))
+            and tie_text(pre.get("preprocess_status")) == "passed"
+        )
+        input_las = tie_text(pre.get("preprocessed_las")) if pre is not None else ""
+        wellbore_initial = tie_text(inv.get("wellbore_class")) or "unknown"
+        wellbore_qc = tie_text(traj.get("wellbore_class_qc")) if traj is not None else wellbore_initial
+        trajectory_status = tie_text(traj.get("trajectory_status")) if traj is not None else ""
+        if trajectory_status == "failed":
+            wellbore_qc = "unknown"
+
+        reasons: list[str] = []
+        if not in_allowed_survey:
+            reasons.append(f"survey_position_{survey_position or 'unknown'}")
+        if pre is None:
+            reasons.append("no_preprocess_record")
+        if not usable_p:
+            reasons.append("unusable_p_sonic")
+        if not usable_rho:
+            reasons.append("unusable_density")
+        if not input_las:
+            reasons.append("no_preprocessed_las")
+
+        well_role = role_for(well_name)
+        route = TieRoute.REJECTED.value
+        route_status = "rejected"
+        route_reasons = list(reasons)
+
+        base_assets_ok = in_allowed_survey and usable_p and usable_rho and bool(input_las)
+        if domain == "depth":
+            if base_assets_ok and wellbore_qc == "vertical":
+                route = TieRoute.VERTICAL_LOCAL_DEPTH.value
+            elif base_assets_ok and wellbore_qc == "deviated" and has_well_trace:
+                route = TieRoute.DEVIATED_LOCAL_DEPTH.value
+        elif base_assets_ok and wellbore_qc == "vertical" and has_time_depth:
+            route = TieRoute.VERTICAL_WITH_TDT.value
+        elif base_assets_ok and wellbore_qc == "vertical" and (not has_time_depth) and has_well_tops:
+            route = TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value
+        elif base_assets_ok and wellbore_qc == "deviated" and has_time_depth and has_well_trace:
+            route = TieRoute.DEVIATED_WITH_TDT.value
+        elif base_assets_ok and wellbore_qc == "deviated" and (not has_time_depth) and has_well_trace and has_well_tops:
+            route = TieRoute.DEVIATED_ANCHOR_FROM_TOPS.value
+        else:
+            if wellbore_qc not in {"vertical", "deviated"}:
+                route_reasons.append(f"wellbore_class_{wellbore_qc or 'unknown'}")
+            if domain == "time" and not has_time_depth:
+                route_reasons.append("no_time_depth")
+            if domain == "depth" and wellbore_qc == "deviated" and not has_well_trace:
+                route_reasons.append("no_well_trace")
+            if domain == "time" and not has_well_tops:
+                route_reasons.append("no_well_tops")
+
+        if well_role != "trusted" and route == TieRoute.REJECTED.value:
+            route_reasons.append(f"well_role_{well_role}")
+
+        if route != TieRoute.REJECTED.value:
+            if well_role != "trusted":
+                route_status = "skipped_role"
+                route_reasons = [f"well_role_{well_role}"]
+            elif route in enabled:
+                route_status = "planned"
+                route_reasons = []
+            else:
+                route_status = "skipped_disabled"
+                route_reasons = [f"route_disabled_{route}"]
+
+        plans.append(
+            WellTiePlan(
+                well_name=well_name,
+                route=route,
+                route_status=route_status,
+                wellbore_class_initial=wellbore_initial,
+                wellbore_class_qc=wellbore_qc,
+                has_time_depth=has_time_depth,
+                has_well_trace=has_well_trace,
+                has_well_tops=has_well_tops,
+                usable_p_sonic=bool(usable_p),
+                usable_density=bool(usable_rho),
+                input_las=input_las,
+                time_depth_file=_path_for_lookup(time_depth_lookup, well_name),
+                well_trace_file=_path_for_lookup(trace_lookup, well_name),
+                surface_x=_optional_float(inv.get("surface_x")),
+                surface_y=_optional_float(inv.get("surface_y")),
+                kb_m=_optional_float(inv.get("kb_m")),
+                reasons=";".join(dict.fromkeys(route_reasons)),
+                well_role=well_role,
+            )
+        )
+
+    return plans
+
+
+def plans_dataframe(plans: Sequence[WellTiePlan]) -> pd.DataFrame:
+    columns = list(WellTiePlan.__dataclass_fields__.keys())
+    return pd.DataFrame.from_records([plan.to_row() for plan in plans], columns=columns)
+
+
+def results_dataframe(results: Sequence[WellTieResult]) -> pd.DataFrame:
+    columns = list(WellTieResult.__dataclass_fields__.keys())
+    return pd.DataFrame.from_records([result.to_row() for result in results], columns=columns)
+
+
+def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """根据配置构建 auto-tie 超参数搜索空间。"""
+
+    def range_parameter(name: str, bounds: Any) -> dict[str, Any]:
+        values = list(bounds)
+        if len(values) == 2 and values[0] == values[1]:
+            return {"name": name, "type": "fixed", "value": values[0]}
+        return {"name": name, "type": "range", "bounds": values, "value_type": "float"}
+
+    return [
+        {
+            "name": "logs_median_size",
+            "type": "choice",
+            "values": list(config["logs_median_size_values"]),
+            "value_type": "int",
+            "is_ordered": True,
+            "sort_values": True,
+        },
+        range_parameter("logs_median_threshold", config["logs_median_threshold_bounds"]),
+        range_parameter("logs_std", config["logs_std_bounds"]),
+        range_parameter("table_t_shift", config["table_t_shift_bounds"]),
+    ]
 
 def build_plans(
     *,
@@ -1498,7 +1695,24 @@ def execute_well(
     return result, extra
 
 
-# Shared extraction and candidate inventory
+# Wtie resources and candidate inventory
+
+def resolve_wtie_asset(
+    value: str | Path | None,
+    *,
+    filename: str,
+    data_root: Path,
+    repo_root: Path,
+) -> Path:
+    """Resolve an explicit asset or the repository's public pretrained asset.
+
+    An explicit value is resolved relative to the configured data root.
+    """
+    target = repo_root / "opendata" / "pretrained" / "wtie" / filename
+    if value is None or not str(value).strip():
+        return target.resolve()
+    return resolve_relative_path(value, root=data_root)
+
 
 def load_wavelet_extractor(model_path: Path, params_path: Path) -> Any:
     if not model_path.exists():
@@ -1537,4 +1751,9 @@ def write_wavelet_inventory(results: list[WellTieResult], extras: dict[str, dict
     out.to_csv(output_dir / "wavelet_inventory.csv", index=False)
     return out
 
-__all__ = ["prepare_time_route", "prepare_depth_route", "execute_well", "run_fixed_tie", "build_plans", "select_plans", "load_wavelet_extractor", "write_wavelet_inventory"]
+__all__ = [
+    "TieRoute", "build_tie_plan", "build_plans", "select_plans",
+    "plans_dataframe", "results_dataframe", "build_auto_tie_search_space",
+    "prepare_time_route", "prepare_depth_route", "execute_well", "run_fixed_tie",
+    "resolve_wtie_asset", "load_wavelet_extractor", "write_wavelet_inventory",
+]

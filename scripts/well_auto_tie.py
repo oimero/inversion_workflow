@@ -27,10 +27,10 @@ from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig, load_workflow_config, merge_dict_defaults
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import repo_relative_path, write_json
-from cup.well.pretrained import resolve_wtie_asset
 from cup.well.petrel import import_well_tops_petrel
-from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION, TieRoute, WellTiePlan, WellTieResult, plans_dataframe, results_dataframe
+from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION, WellTiePlan, WellTieResult
 from cup.well.auto_tie import (
+    TieRoute, plans_dataframe, results_dataframe, resolve_wtie_asset,
     resolve_repo_path, resolve_data_path, load_anchor_config, load_manual_shift_config,
     ensure_output_dirs, prepare_time_route, prepare_depth_route, execute_well,
     build_plans, select_plans, RerouteToAnchor, load_wavelet_extractor, write_wavelet_inventory,

@@ -25,10 +25,17 @@ from cup.well.tie import (
     prepare_well_for_evaluation,
     results_dataframe,
     WELL_AUTO_TIE_SCHEMA_VERSION,
+    scaled_synthetic_metrics,
 )
+from cup.well.trajectory import write_time_depth_table_csv
+from cup.well.tie import WellTieResult
+from cup.well.auto_tie import ensure_output_dirs, output_paths
+from cup.well.auto_tie import run_fixed_tie
+from cup.well.auto_tie import load_wavelet_extractor, write_wavelet_inventory
 from cup.well.las import load_standard_vp_rho_logs
 from cup.well.trajectory import PreparedTieWindow
-from cup.seismic.wavelet import wavelet_l2_normalize
+from cup.seismic.wavelet import crop_wavelet_center_energy_normalize, wavelet_l2_normalize
+from cup.seismic.wavelet_consensus import WAVELET_GENERATION_SCHEMA_VERSION
 from ginn_v3.workflow import load_config
 from marmousi2.seismic import training_well_correlations
 from wtie.processing import grid
@@ -40,7 +47,7 @@ def prepare_tie_inputs(prepared_dir: Path, *, repo_root: Path, pretrained_dir: P
     prepared_dir, repo_root = Path(prepared_dir).resolve(), Path(repo_root).resolve()
     adapter = prepared_dir / "wavelet_inputs"
     relative = lambda p: repo_relative_path(p, root=repo_root)
-    directories = {name: adapter / name for name in ("well_inventory", "well_screen", "well_preprocess", "time_depth", "interpre")}
+    directories = {name: adapter / name for name in ("well_inventory", "well_preprocess", "time_depth", "interpre")}
     directories["las"] = directories["well_preprocess"] / "preprocessed_las"
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
@@ -68,7 +75,6 @@ def prepare_tie_inputs(prepared_dir: Path, *, repo_root: Path, pretrained_dir: P
         preprocess.append({"well_name": well.well_name, "preprocess_status": "passed", "usable_p_sonic": True,
                            "usable_density": True, "preprocessed_las": relative(las_path)})
     pd.DataFrame(inventory).to_csv(directories["well_inventory"] / "well_inventory.csv", index=False)
-    pd.DataFrame({"well_name": training.well_name}).to_csv(directories["well_screen"] / "well_screen.csv", index=False)
     pd.DataFrame(preprocess).to_csv(directories["well_preprocess"] / "well_preprocess_status.csv", index=False)
     with np.load(prepared_dir / "evaluation" / "truth.npz", allow_pickle=False) as saved:
         x, times = saved["x_m"], saved["twt_s"]
@@ -81,7 +87,7 @@ def prepare_tie_inputs(prepared_dir: Path, *, repo_root: Path, pretrained_dir: P
     config["assets"]["time_depth_dir"] = str(directories["time_depth"].relative_to(prepared_dir)).replace("\\", "/")
     public_wtie_root = Path(pretrained_dir).resolve() if pretrained_dir is not None else repo_root / "opendata" / "pretrained" / "wtie"
     config["well_auto_tie"] = {
-        "source_runs": {f"{name}_dir": relative(directories[name]) for name in ("well_inventory", "well_screen", "well_preprocess")},
+        "source_runs": {f"{name}_dir": relative(directories[name]) for name in ("well_inventory", "well_preprocess")},
         "enabled_routes": ["vertical_with_tdt"],
         "target_interval": {"top_horizon": "wavelet_inputs/interpre/top.txt", "bottom_horizon": "wavelet_inputs/interpre/bottom.txt",
                             "margin_top_ms": 0, "margin_bottom_ms": 0, "twt_unit": "s"},
@@ -125,16 +131,6 @@ def _network_wtie_artifacts(
     neural wavelet extraction and its normal convolutional scoring; no ridge
     estimate is used on this default path.
     """
-    import importlib.util
-
-    module_spec = importlib.util.spec_from_file_location(
-        "mero_main_well_auto_tie",
-        repo_root / "scripts" / "well_auto_tie.py",
-    )
-    if module_spec is None or module_spec.loader is None:
-        raise ImportError("Could not load the main well_auto_tie library adapter.")
-    auto_tie = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(auto_tie)
     prepared_dir = Path(prepared_dir).resolve()
     repo_root = Path(repo_root).resolve()
     roles = pd.read_csv(prepared_dir / "evaluation" / "well_roles.csv")
@@ -162,11 +158,11 @@ def _network_wtie_artifacts(
     expected_dt = float(params["synthetic_dataset"]["dt"])
     preparation = json.loads((prepared_dir / "preparation_summary.json").read_text(encoding="utf-8"))
     target_top, target_bottom = preparation["target_interval_s"]
-    wavelet_extractor = auto_tie._load_wavelet_extractor(model_path, params_path)
+    wavelet_extractor = load_wavelet_extractor(model_path, params_path)
     modeler = ConvModeler()
     step4 = prepared_dir / "step4_well_auto_tie"
     step5 = prepared_dir / "step5_wavelet_generation"
-    auto_tie._ensure_output_dirs(step4)
+    ensure_output_dirs(step4, sample_domain="time")
     for directory in (step5 / "synthetic_qc", step5 / "figures"):
         directory.mkdir(parents=True, exist_ok=True)
     results = []
@@ -231,9 +227,9 @@ def _network_wtie_artifacts(
                 "tie_window_end_s": float(continuous.end_twt_s),
             },
         )
-        from wtie.optimize import autotie, tie as tie_ops
+        from wtie.optimize import tie as tie_ops
 
-        paths = auto_tie._build_output_paths(step4, name)
+        paths = output_paths(step4, name, sample_domain="time")
         paths["figure_dir"].mkdir(parents=True, exist_ok=True)
         seismic_trace = grid.Seismic(seismic[int(row.profile_index)], times, "twt", name=name)
         params = {
@@ -242,14 +238,13 @@ def _network_wtie_artifacts(
             "logs_std": 0.001,
             "table_t_shift": 0.0,
         }
-        outputs = autotie._intermediate_tie_v1(
-            continuous.logs,
-            None,
-            table,
-            seismic_trace,
-            wavelet_extractor,
-            modeler,
-            params,
+        outputs = run_fixed_tie(
+            logset_md=continuous.logs,
+            table=table,
+            seismic=seismic_trace,
+            wavelet_extractor=wavelet_extractor,
+            modeler=modeler,
+            parameters=params,
         )
         wavelet = tie_ops.compute_wavelet(
             outputs.seismic,
@@ -261,14 +256,14 @@ def _network_wtie_artifacts(
             expected_value=False,
             scaling_params={"wavelet_min_scale": 0.1, "wavelet_max_scale": 100.0, "num_iters": 16},
         )
-        cropped_wavelet, _crop_info = auto_tie.crop_wavelet_center_energy_normalize(wavelet, 201.0)
+        cropped_wavelet, _crop_info = crop_wavelet_center_energy_normalize(wavelet, 201.0)
         pd.DataFrame({"twt_s": outputs.seismic.basis, "seismic": outputs.seismic.values}).to_csv(paths["seismic_trace"], index=False)
-        auto_tie.write_time_depth_table_csv(table, paths["initial_tdt"])
-        auto_tie.write_time_depth_table_csv(table, paths["optimized_tdt"])
+        write_time_depth_table_csv(table, paths["initial_tdt"])
+        write_time_depth_table_csv(table, paths["optimized_tdt"])
         pd.DataFrame({"time_s": cropped_wavelet.basis, "amplitude": cropped_wavelet.values}).to_csv(paths["wavelet"], index=False)
         filtered_las_path = paths["filtered_las"]
         shutil.copy2(filtered_las, filtered_las_path)
-        seismic_norm, synthetic, optimized_corr, optimized_nmae, synthetic_scale = auto_tie.scaled_synthetic_metrics(
+        seismic_norm, synthetic, optimized_corr, optimized_nmae, synthetic_scale = scaled_synthetic_metrics(
             modeler, cropped_wavelet, outputs.r, outputs.seismic,
         )
         pd.DataFrame({
@@ -278,7 +273,7 @@ def _network_wtie_artifacts(
             "synthetic_cropped_scaled": synthetic,
             "residual": seismic_norm - synthetic,
         }).to_csv(paths["synthetic_qc"], index=False)
-        result = auto_tie.WellTieResult(
+        result = WellTieResult(
             well_name=name,
             route="vertical_with_tdt",
             tie_status="success",
@@ -305,8 +300,21 @@ def _network_wtie_artifacts(
     plan_path = step4 / "well_tie_plan.csv"
     pd.DataFrame.from_records(plan_rows).to_csv(plan_path, index=False)
     metrics = results_dataframe(results)
+    metrics["sample_domain"] = "time"
+    metrics["well_role"] = "trusted"
+    metrics["max_short_log_gap_s"] = 0.0
+    metrics["tie_window_start_s"] = [float(extras[row.well_name]["tie_window"]["tie_window_start_s"]) for row in training.itertuples(index=False)]
+    metrics["tie_window_end_s"] = [float(extras[row.well_name]["tie_window"]["tie_window_end_s"]) for row in training.itertuples(index=False)]
+    metrics["filtered_las_file"] = [extras[row.well_name]["filtered_las_file"] for row in training.itertuples(index=False)]
+    metrics["optimized_tdt_file"] = metrics["optimized_tdt_file"].astype(str)
+    metrics["seismic_trace_file"] = [extras[row.well_name]["seismic_trace_file"] for row in training.itertuples(index=False)]
+    metrics["aligned_depth_file"] = None
+    metrics["source_depth_mapping_file"] = None
+    metrics["depth_seismic_trace_file"] = None
+    metrics["target_top_tvdss_m"] = None
+    metrics["target_bottom_tvdss_m"] = None
     metrics.to_csv(step4 / "well_tie_metrics.csv", index=False)
-    auto_tie._write_wavelet_inventory(results, step4)
+    write_wavelet_inventory(results, extras, repo_root=repo_root, output_dir=step4)
     pd.DataFrame.from_records([
         {
             "well_name": result.well_name,
@@ -323,7 +331,15 @@ def _network_wtie_artifacts(
     step4_summary = {
         "schema_version": WELL_AUTO_TIE_SCHEMA_VERSION,
         "status": "success",
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "depth_basis": None,
         "route": "vertical_with_tdt",
+        "inputs": {
+            "well_inventory_dir": repo_relative_path(prepared_dir / "wavelet_inputs" / "well_inventory", root=repo_root),
+            "well_preprocess_dir": repo_relative_path(prepared_dir / "wavelet_inputs" / "well_preprocess", root=repo_root),
+        },
+        "well_roles": {str(row.well_name): "trusted" for row in training.itertuples(index=False)},
         "calibration_method": "wtie_neural_wavelet_extractor_fixed_model_tdt",
         "wavelet_extractor": {
             "model": repo_relative_path(model_path, root=repo_root),
@@ -333,7 +349,7 @@ def _network_wtie_artifacts(
         "table_t_shift_bounds_s": [0.0, 0.0],
         "well_count": len(results),
         "successful_tie_count": len(results),
-        "outputs": {
+        "paths": {
             "well_tie_plan": repo_relative_path(plan_path, root=repo_root),
             "well_tie_metrics": repo_relative_path(step4 / "well_tie_metrics.csv", root=repo_root),
             "wavelet_inventory": repo_relative_path(step4 / "wavelet_inventory.csv", root=repo_root),
@@ -371,7 +387,6 @@ def _network_wavelet_consensus(
     from cup.well.tie import (
         evaluate_wavelet_on_well,
         load_tie_artifacts,
-        prepare_well_for_evaluation,
     )
 
     index = load_tie_artifacts(step4, repo_root=repo_root)
@@ -468,8 +483,11 @@ def _network_wavelet_consensus(
     pd.DataFrame.from_records(all_metric_rows).to_csv(step5 / "wavelet_candidate_metrics.csv", index=False)
     pd.DataFrame.from_records(aggregate_rows).to_csv(step5 / "wavelet_candidate_aggregate.csv", index=False)
     summary = {
-        "schema_version": "wavelet_generation_v2",
+        "schema_version": WAVELET_GENERATION_SCHEMA_VERSION,
         "status": "success",
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "depth_basis": None,
         "selection_mode": "main_consensus_optimizer" if selected_name == "optimized_consensus" else "existing_candidate_wins",
         "selected_wavelet": selected_name,
         "selected_source_well": selected_name,

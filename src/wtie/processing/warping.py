@@ -63,7 +63,7 @@ def dynamic_lag(s1: np.ndarray,
     """Compute per-sample lag bewtween reference s1 trace and s2 trace.
     TODO: numba"""
     assert s1.size == s2.size
-    lags_idx = np.zeros((s1.size,), dtype=np.int)
+    lags_idx = np.zeros((s1.size,), dtype=int)
 
     assert max_lag_idx < window_lenght // 2
 

@@ -77,7 +77,7 @@ def _controls(log_ai, axis, x_m, roles):
         ))
         row = dict.fromkeys(MANIFEST_COLUMNS, "")
         row.update(
-            well_name=name, status="ok", source_run_type="marmousi2_synthetic", wellbore_class="vertical",
+            well_name=name, well_role="trusted", status="ok", source_run_type="marmousi2_synthetic", wellbore_class="vertical",
             sample_domain="time", sample_unit="s", sampling_mode="synthetic_model_axis", n_samples=n,
             n_valid_samples=n, n_observed_samples=n, n_interpolated_samples=0, n_native_samples=n,
             n_valid_native_samples=n, sample_min=float(axis.values[0]), sample_max=float(axis.values[-1]),

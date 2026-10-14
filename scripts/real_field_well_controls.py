@@ -16,7 +16,6 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
-import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -25,24 +24,19 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.config.sources import resolve_source_file_from_run
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
+from cup.seismic.wavelet_consensus import WAVELET_GENERATION_SCHEMA_VERSION
+from cup.synthetic.schemas import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 from cup.config.artifacts import is_consumable_contract_status, latest_checked_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.controls import (
-    DEPTH_SOURCE_SCHEMA,
-    QC_SCHEMA_VERSION,
-    TIME_SOURCE_SCHEMA,
-    build_evaluation_support,
+    WELL_TIE_SOURCE_SCHEMA,
     build_well_control_set,
-    horizon_markers_along_control,
-    sample_seismic_along_control,
-    write_depth_well_control_qc,
+    write_well_control_qc,
     write_well_control_set,
 )
-from cup.well.evaluation_support import write_evaluation_support_manifest
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,14 +56,12 @@ def _load_composed_config(path: Path) -> dict[str, Any]:
     return deep_merge_dict(common, overlay)
 
 
-def _source_validator(*, source_run_type: str, domain: str, depth_basis: str | None):
-    expected_schema = TIME_SOURCE_SCHEMA if source_run_type == "well_auto_tie" else DEPTH_SOURCE_SCHEMA
-
+def _source_validator(*, domain: str, depth_basis: str | None):
     def validate(path: Path) -> None:
         with (path / "run_summary.json").open("r", encoding="utf-8") as handle:
             summary = json.load(handle)
-        if summary.get("schema_version") != expected_schema:
-            raise ValueError(f"schema_version is not {expected_schema}")
+        if summary.get("schema_version") != WELL_TIE_SOURCE_SCHEMA:
+            raise ValueError(f"schema_version is not {WELL_TIE_SOURCE_SCHEMA}")
         if summary.get("sample_domain") != domain or summary.get("depth_basis") != depth_basis:
             raise ValueError("source domain/depth_basis does not match workflow seismic")
         if not is_consumable_contract_status(summary.get("status")):
@@ -79,27 +71,19 @@ def _source_validator(*, source_run_type: str, domain: str, depth_basis: str | N
 
 
 def _resolve_source_run(config: dict[str, Any], workflow: WorkflowConfig) -> Path:
-    source_run_type = str(config.get("source_run_type") or "").strip()
-    if source_run_type not in {"well_auto_tie", "wavelet_batch_synthetic_depth"}:
-        raise ValueError("real_field_well_controls.source_run_type must be explicit.")
-    explicit = str(config.get("source_run_dir") or "").strip()
+    source_runs = config.get("source_runs")
+    if not isinstance(source_runs, Mapping):
+        raise ValueError("real_field_well_controls.source_runs must be a mapping.")
+    explicit = str(source_runs.get("well_auto_tie_dir") or "").strip()
     if explicit:
         return resolve_relative_path(explicit, root=REPO_ROOT)
-    prefix = source_run_type
-    required = (
-        ["run_summary.json", "well_tie_metrics.csv"]
-        if source_run_type == "well_auto_tie"
-        else ["run_summary.json", "wavelet_batch_metrics.csv"]
-    )
     return latest_checked_run(
         resolve_relative_path(workflow.output_root, root=REPO_ROOT),
-        prefix,
-        required_files=required,
-        validator=_source_validator(
-            source_run_type=source_run_type,
-            domain=workflow.seismic.domain,
-            depth_basis=workflow.seismic.depth_basis,
-        ),
+        "well_auto_tie",
+        required_files=["run_summary.json", "well_tie_metrics.csv"],
+        validator=lambda path: _source_validator(
+            domain=workflow.seismic.domain, depth_basis=workflow.seismic.depth_basis
+        )(path),
     )
 
 
@@ -108,51 +92,142 @@ def _resolved_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str,
     if not config:
         raise ValueError("Config lacks real_field_well_controls section.")
     config.pop("qc", None)
-    config["source_run_dir"] = str(_resolve_source_run(config, workflow))
-    inventory_value = str(config.get("well_inventory_file") or "").strip()
-    if inventory_value:
-        inventory = resolve_relative_path(inventory_value, root=REPO_ROOT)
-    else:
-        inventory = resolve_source_file_from_run(
-            None,
-            output_root=resolve_relative_path(workflow.output_root, root=REPO_ROOT),
-            prefix="well_inventory",
-            file_name="well_inventory.csv",
-            root=REPO_ROOT,
-            label="well_inventory_file",
-        )
-    config["well_inventory_file"] = str(inventory)
+    source_run_dir = _resolve_source_run(config, workflow)
+    with (source_run_dir / "run_summary.json").open("r", encoding="utf-8") as handle:
+        source_summary = json.load(handle)
+    source_runs = dict(config.get("source_runs") or {})
+
+    def resolve_input_dir(explicit: Any, keys: tuple[str, ...], label: str) -> Path:
+        text = str(explicit or "").strip()
+        if text:
+            path = resolve_relative_path(text, root=REPO_ROOT)
+            if not path.is_dir():
+                raise FileNotFoundError(f"{label}: {path}")
+            return path
+        inputs = dict(source_summary.get("inputs") or {})
+        for key in keys:
+            value = str(inputs.get(key) or "").strip()
+            if not value:
+                continue
+            path = resolve_relative_path(value, root=REPO_ROOT)
+            if path.is_file():
+                path = path.parent
+            if path.is_dir():
+                return path
+        raise FileNotFoundError(f"Cannot derive {label} from Step-4 run_summary.inputs.")
+
+    source_runs["well_auto_tie_dir"] = str(source_run_dir)
+    source_runs["well_preprocess_dir"] = str(resolve_input_dir(
+        source_runs.get("well_preprocess_dir"),
+        ("well_preprocess_dir",),
+        "well_preprocess_dir",
+    ))
+    source_runs["well_inventory_dir"] = str(resolve_input_dir(
+        source_runs.get("well_inventory_dir"),
+        ("well_inventory_dir",),
+        "well_inventory_dir",
+    ))
+    config["source_runs"] = source_runs
     config["well_trace_dir"] = workflow.assets.well_trace_dir
+    config["time_depth_dir"] = workflow.assets.time_depth_dir
+    inventory_path = Path(source_runs["well_inventory_dir"]) / "well_inventory.csv"
+    if not inventory_path.is_file():
+        raise FileNotFoundError(inventory_path)
+    import pandas as pd
+    inventory = pd.read_csv(inventory_path)
+    if "well_name" not in inventory.columns:
+        raise ValueError(f"well inventory is missing well_name: {inventory_path}")
+    workflow.well_usage.validate_names(inventory["well_name"])
+    metrics = pd.read_csv(source_run_dir / "well_tie_metrics.csv")
+    if "well_name" not in metrics.columns or "tie_status" not in metrics.columns:
+        raise ValueError("Step 4 well_tie_metrics.csv must contain well_name and tie_status.")
+    metric_by_name = {
+        str(row["well_name"]).strip().casefold(): row
+        for _, row in metrics.iterrows()
+    }
+    plan_path = source_run_dir / "well_tie_plan.csv"
+    plan = pd.read_csv(plan_path) if plan_path.is_file() else pd.DataFrame()
+    plan_by_name = {
+        str(row["well_name"]).strip().casefold(): row
+        for _, row in plan.iterrows()
+    } if "well_name" in plan.columns else {}
+    explicit_trusted = workflow.well_usage.trusted_well_names is not None
+    roles: dict[str, str] = {}
+    role_reasons: dict[str, str] = {}
+    for name in inventory["well_name"]:
+        display = str(name).strip()
+        key = display.casefold()
+        central_role = workflow.well_usage.role_for(display)
+        if central_role == "background_only":
+            role = "background_only"
+        elif explicit_trusted:
+            role = central_role
+        else:
+            metric = metric_by_name.get(key)
+            success = metric is not None and str(metric.get("tie_status") or "").casefold() == "success"
+            role = "trusted" if success else "excluded"
+        roles[display] = role
+        if role == "excluded":
+            metric = metric_by_name.get(key)
+            plan_row = plan_by_name.get(key)
+            reason = str(metric.get("reasons") or "").strip() if metric is not None else ""
+            if reason.casefold() in {"nan", "none", "null"}:
+                reason = ""
+            if not reason and plan_row is not None:
+                reason = str(plan_row.get("reasons") or "").strip()
+                if reason.casefold() in {"nan", "none", "null"}:
+                    reason = ""
+            role_reasons[display] = reason or "step4_well_not_successful"
+    config["well_roles"] = roles
+    config["well_role_reasons"] = role_reasons
+    config["central_trusted_well_names"] = (
+        list(workflow.well_usage.trusted_well_names)
+        if workflow.well_usage.trusted_well_names is not None else None
+    )
     return config
 
 
-def _resolve_forward_inputs_run(raw: dict[str, Any], workflow: WorkflowConfig) -> tuple[Path, dict[str, Any]]:
+def _resolve_qc_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str, Any]:
     section = raw.get("real_field_well_controls")
     qc = section.get("qc") if isinstance(section, Mapping) else None
     if not isinstance(qc, Mapping) or not qc:
         raise ValueError("Config requires a real_field_well_controls.qc mapping.")
     config = dict(qc)
-    explicit = str(config.pop("forward_model_inputs_run_dir", "") or "").strip()
-    if explicit:
-        run_dir = resolve_relative_path(explicit, root=REPO_ROOT)
-    else:
-        def validate(path: Path) -> None:
-            with (path / "forward_model_inputs.json").open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if (
-                payload.get("schema") != "forward_model_inputs_v3"
-                or payload.get("sample_domain") != workflow.seismic.domain
-                or payload.get("depth_basis") != workflow.seismic.depth_basis
-            ):
-                raise ValueError("forward model inputs do not match the workflow seismic domain")
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    if workflow.seismic.domain == "depth":
+        key, prefix = "forward_model_inputs_run_dir", "depth_forward_model_inputs"
+        required = ["run_summary.json", "forward_model_inputs.json"]
 
-        run_dir = latest_checked_run(
-            resolve_relative_path(workflow.output_root, root=REPO_ROOT),
-            "depth_forward_model_inputs",
-            required_files=["forward_model_inputs.json"],
+        def validate(path: Path) -> None:
+            with (path / "forward_model_inputs.json").open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if (payload.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION or payload.get("sample_domain") != "depth"
+                    or payload.get("depth_basis") != "tvdss"):
+                raise ValueError("QC forward inputs do not match the depth/TVDSS workflow.")
+    else:
+        key, prefix = "wavelet_generation_run_dir", "wavelet_generation"
+        required = ["run_summary.json", "selected_wavelet.csv"]
+
+        def validate(path: Path) -> None:
+            with (path / "run_summary.json").open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if (payload.get("schema_version") != WAVELET_GENERATION_SCHEMA_VERSION
+                    or not is_consumable_contract_status(payload.get("status"))
+                    or payload.get("sample_domain") != "time" or payload.get("depth_basis") is not None):
+                raise ValueError("QC wavelet run does not match the time-domain workflow.")
+    explicit = str(config.get(key) or "").strip()
+    if explicit:
+        path = resolve_relative_path(explicit, root=REPO_ROOT)
+        validate(path)
+    else:
+        path = latest_checked_run(
+            output_root=output_root,
+            prefix=prefix,
+            required_files=required,
             validator=validate,
         )
-    return run_dir, config
+    config[key] = str(path)
+    return config
 
 
 def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
@@ -161,25 +236,6 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     return output_root / f"real_field_well_controls_{timestamp}"
-
-
-def _build_time_evaluation_supports(controls: Any, *, survey: Any, target_zone: Any) -> dict[str, Any]:
-    """Build and persist the current time-domain Step-6 evaluation support."""
-
-    if controls.sample_domain != "time" or controls.depth_basis is not None:
-        raise ValueError("Time evaluation support requires time-domain well controls.")
-    supports: dict[str, Any] = {}
-    for control in controls.controls:
-        real = sample_seismic_along_control(control, survey)
-        markers = horizon_markers_along_control(control, target_zone)
-        supports[control.well_name] = build_evaluation_support(
-            control,
-            target_interval=(float(markers[0][0]), float(markers[-1][0])),
-            observed_support=control.observed_valid_mask,
-            well_curve_support=control.valid_mask,
-            additional_support=(np.isfinite(real),),
-        )
-    return supports
 
 
 def main() -> None:
@@ -221,66 +277,25 @@ def main() -> None:
         repo_root=REPO_ROOT,
     )
     qc_dir = None
-    if workflow.seismic.domain == "depth":
-        forward_inputs_run, qc_config = _resolve_forward_inputs_run(raw, workflow)
-        qc_dir = output_dir / "qc"
-        qc_manifest = write_depth_well_control_qc(
-            controls,
-            survey=survey,
-            target_zone=target_zone,
-            forward_inputs_run_dir=forward_inputs_run,
-            output_dir=qc_dir,
-            repo_root=REPO_ROOT,
-            config=qc_config,
-        )
-        summary["outputs"]["qc_manifest"] = repo_relative_path(
-            qc_dir / "manifest.json",
-            root=REPO_ROOT,
-        )
-        summary["outputs"]["evaluation_support"] = qc_manifest["evaluation_support"]
-        summary["qc"] = qc_manifest
-        write_json(output_dir / "run_summary.json", summary)
-    else:
-        supports = _build_time_evaluation_supports(
-            controls,
-            survey=survey,
-            target_zone=target_zone,
-        )
-        qc_dir = output_dir / "qc"
-        qc_dir.mkdir(parents=True, exist_ok=False)
-        support_path = qc_dir / "evaluation_support.json"
-        write_evaluation_support_manifest(
-            support_path,
-            sample_axis=controls.sample_axis,
-            supports=supports,
-            source="real_field_well_controls_time",
-        )
-        support_relative = repo_relative_path(support_path, root=REPO_ROOT)
-        qc_manifest = {
-            "schema_version": QC_SCHEMA_VERSION,
-            "status": "ok",
-            "sample_domain": "time",
-            "depth_basis": None,
-            "evaluation_support": support_relative,
-            "outputs": {"evaluation_support": support_relative},
-            "well_count": len(supports),
-        }
-        write_json(qc_dir / "manifest.json", qc_manifest)
-        summary["outputs"]["qc_manifest"] = repo_relative_path(
-            qc_dir / "manifest.json",
-            root=REPO_ROOT,
-        )
-        summary["outputs"]["evaluation_support"] = support_relative
-        summary["qc"] = qc_manifest
-        write_json(output_dir / "run_summary.json", summary)
+    qc_config = _resolve_qc_config(raw, workflow)
+    qc_dir = output_dir / "qc"
+    qc_manifest = write_well_control_qc(
+        controls,
+        survey=survey,
+        target_zone=target_zone,
+        output_dir=qc_dir,
+        repo_root=REPO_ROOT,
+        config=qc_config,
+    )
+    summary["outputs"]["qc_manifest"] = repo_relative_path(qc_dir / "manifest.json", root=REPO_ROOT)
+    summary["outputs"]["evaluation_support"] = qc_manifest["evaluation_support"]
+    summary["qc"] = qc_manifest
+    write_json(output_dir / "run_summary.json", summary)
     print("=== Real-field Well Controls ===")
     print(f"Output: {output_dir}")
     print(f"Successful wells: {summary['counts']['successful_wells']}")
     if qc_dir is not None:
-        if workflow.seismic.domain == "depth":
-            print(f"QC figures: {qc_dir / 'figures'}")
-        else:
-            print(f"Evaluation support: {qc_dir / 'evaluation_support.json'}")
+        print(f"QC figures: {qc_dir / 'figures'}")
 
 
 if __name__ == "__main__":

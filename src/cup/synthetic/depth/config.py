@@ -10,6 +10,7 @@ import numpy as np
 
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
+from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.synthetic.core.calibration import SCHEMA_VERSION as CALIBRATION_SCHEMA
 from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
@@ -22,7 +23,6 @@ from cup.synthetic.core.config import parse_object_core_controls
 from cup.synthetic.core.corpus import CorpusBudget
 from cup.config.artifacts import (
     is_consumable_contract_status,
-    require_contract_fingerprint,
     resolve_artifact_path,
 )
 from cup.utils.io import load_yaml_config, resolve_relative_path
@@ -196,7 +196,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "well_inventory_dir",
             "rock_physics_analysis_dir",
             "depth_forward_model_inputs_dir",
-            "wavelet_batch_synthetic_depth_dir",
+            "well_auto_tie_dir",
         },
         path="synthoseis_lite.source_runs",
     )
@@ -330,7 +330,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "depth_forward_model_inputs_dir": str(
                 sources.get("depth_forward_model_inputs_dir") or ""
             ).strip(),
-            "wavelet_batch_synthetic_depth_dir": str(sources.get("wavelet_batch_synthetic_depth_dir") or "").strip(),
+            "well_auto_tie_dir": str(sources.get("well_auto_tie_dir") or "").strip(),
         },
         "horizons": horizons,
         "sections": sections,
@@ -401,7 +401,7 @@ def resolve_depth_sources(
             "depth_forward_model_inputs",
             ["forward_model_inputs.json", "run_summary.json"],
         ),
-        "wavelet_batch_synthetic_depth_dir": ("wavelet_batch_synthetic_depth", ["run_summary.json", "wavelet_batch_metrics.csv"]),
+        "well_auto_tie_dir": ("well_auto_tie", ["run_summary.json", "well_tie_metrics.csv"]),
     }
     for key, (prefix, files) in definitions.items():
         explicit = str(script_cfg["source_runs"].get(key) or "").strip()
@@ -418,9 +418,6 @@ def resolve_depth_sources(
         provenance[key] = {
             "resolution_mode": "explicit" if explicit else "auto",
             "path": str(path),
-            "contract_fingerprint_sha256": require_contract_fingerprint(
-                source_summary, label=f"{key} {path}"
-            ),
             "required_files": list(files),
         }
 
@@ -434,9 +431,11 @@ def resolve_depth_sources(
         raise ValueError(
             "rock_physics_analysis source is not a consumable contracted run."
         )
-    wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
-    if not is_consumable_contract_status(wavelet_batch_summary.get("status")):
-        raise ValueError("wavelet_batch_synthetic_depth run is not consumable.")
+    tie_summary = _load_json(resolved["well_auto_tie_dir"] / "run_summary.json")
+    if (not is_consumable_contract_status(tie_summary.get("status"))
+            or tie_summary.get("schema_version") != WELL_AUTO_TIE_SCHEMA_VERSION
+            or tie_summary.get("sample_domain") != "depth" or tie_summary.get("depth_basis") != "tvdss"):
+        raise ValueError("well_auto_tie source must be a successful depth/TVDSS run.")
     forward_run_summary = _load_json(
         resolved["depth_forward_model_inputs_dir"] / "run_summary.json"
     )
@@ -476,15 +475,6 @@ def resolve_depth_sources(
         raise ValueError(f"forward_model_inputs schema must be {FORWARD_MODEL_INPUTS_SCHEMA_VERSION}.")
     if forward.get("sample_domain") != "depth" or forward.get("depth_basis") != "tvdss":
         raise ValueError("forward_model_inputs must declare depth/TVDSS.")
-    rock_fingerprint = require_contract_fingerprint(
-        rock_summary, label=f"rock physics run {resolved['rock_physics_analysis_dir']}"
-    )
-    recorded_rock_contract = dict(
-        dict(forward.get("input_contracts") or {}).get("rock_physics_analysis")
-        or {}
-    )
-    if not str(recorded_rock_contract.get("contract_fingerprint_sha256") or ""):
-        raise ValueError("forward_model_inputs lacks rock-physics provenance.")
     relation_path = resolve_relative_path(
         str(dict(forward.get("ai_velocity_relation") or {}).get("path") or ""),
         root=repo_root,
@@ -512,11 +502,6 @@ def resolve_depth_sources(
     if recorded_seismic.resolve() != expected_seismic.resolve():
         raise ValueError("well_inventory seismic source does not match the current workflow config.")
     forward["_path"] = str(forward_path)
-    forward["_contract_fingerprint_sha256"] = require_contract_fingerprint(
-        forward_run_summary,
-        label=f"depth forward-model inputs run {resolved['depth_forward_model_inputs_dir']}",
-    )
-    forward["_rock_physics_contract_fingerprint_sha256"] = rock_fingerprint
     return resolved, provenance, forward
 
 

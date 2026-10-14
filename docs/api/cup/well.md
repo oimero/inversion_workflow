@@ -10,6 +10,8 @@
 
 ::: cup.well.preprocess
 
+::: cup.well.auto_tie
+
 ::: cup.well.controls
 
 ::: cup.well.scale

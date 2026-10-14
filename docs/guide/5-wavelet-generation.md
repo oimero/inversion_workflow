@@ -1,6 +1,6 @@
 # 05 全局共识子波生成
 
-`wavelet_generation.py` 是时间域工作流的第五步。它读取第四步每口成功井产出的子波，在所有井上做交叉评测，再在候选子波张成的低维形态空间中优化出一条全局共识子波，最后用这条子波生成统一的批量合成记录。
+`wavelet_generation.py` 是工作流的第五步。本文按时间域说明：它读取第四步每口准入井产出的候选子波，在所有可评测井上做交叉评测，再在候选子波张成的低维形态空间中优化出一条全局共识子波，最后用这条子波生成统一的批量合成记录。
 
 ---
 
@@ -38,6 +38,13 @@ python scripts/wavelet_generation.py --output-dir scripts/output/<wavelet-genera
 ```yaml
 spatial_debias:
   cluster_radius_m: 600.0
+
+well_usage:
+  trusted_well_names:
+    - <trusted-well-a>
+    - <trusted-well-b>
+  background_only_well_names:
+    - <background-well-a>
 
 wavelet_generation:
   candidate_filter:
@@ -79,12 +86,16 @@ wavelet_generation:
 
   scoring:
     min_eval_well_count: 3
-    on_insufficient_eval_wells: select_best_source_tie
+    on_insufficient_eval_wells: error
 ```
 
 ### `source_runs`
 
 默认自动接上最新一次井震标定结果。复现实验时可按需加入 `source_runs.well_auto_tie_dir` 固定输入。
+
+### 井用途
+
+第五步继承顶层 `well_usage`。可信井同时提供候选子波和共识评测；背景井不进入第五步。`candidate_filter` 和 `evaluation_wells` 仍可在已经通过角色准入的井中做实验性筛选。
 
 ### `candidate_filter`
 
@@ -151,19 +162,20 @@ wavelet_generation:
 
 ### `scoring`
 
-- 如果评测井总数不足 `min_eval_well_count`，脚本不尝试共识优化，降级为选择第四步来源井指标最好的候选子波。
+- `min_eval_well_count` 是共识优化所需的最少评测井数。评测井不足时直接报错，先补足评测井或调整名单后再运行。
+- `on_insufficient_eval_wells` 只能填写 `error`。
 - 共识优化产出的生成子波必须**严格优于**最佳候选子波的分数才会被选中；如果打平或更差，脚本选择最佳候选，并在 summary 中标记 `existing_candidate_wins`。
 
 ---
 
 ## 脚本在做什么
 
-脚本按以下五个阶段处理时间域井震标定产物：
+脚本按以下五个阶段处理第四步的时间域井震标定产物：
 
 1. **加载与质量控制。** 读取第四步的路由计划、标定指标和子波清单，检查候选子波的中心、长度、采样间隔与 L2 能量，并为每口评测井预先计算波阻抗反射系数。
 2. **候选子波交叉评测。** 将测深域波阻抗依据优化时深关系转换到双程旅行时域，与候选子波卷积生成合成记录，再计算相关系数和归一化平均绝对误差；按空间簇聚合逐井指标。
 3. **共识子波搜索。** 对齐候选波形并建立 PCA 形态空间，在投影系数分位数范围内进行随机采样和局部细化；每个搜索点都重新执行全井正演、空间聚合和形态正则化评分。
-4. **全局选择。** 比较最佳共识波形与最佳候选波形的综合分数；评测井数量低于配置下限时，选择第四步来源井指标最好的候选波形。
+4. **全局选择。** 比较最佳共识波形与最佳候选波形的综合分数；评测井数量在进入这一阶段前已通过配置下限检查。
 5. **批量合成。** 使用最终波形在全部评测井上生成合成记录、残差、批量指标和波形质量控制图，图中包含波阻抗、反射系数、合成地震、观测地震、残差和互相关结果。
 
 ---
@@ -177,7 +189,7 @@ wavelet_generation:
 | 文件 | 什么时候看 | 内容 |
 |------|------------|------|
 | `selected_wavelet.csv` | 后续批量合成或反演流程读取时 | 最终输出的全局子波 |
-| `selected_wavelet_summary.json` | 先看 | 选择模式、分数对比、来源井、配置摘要 |
+| `selected_wavelet_summary.json` | 先看 | 选择模式、分数对比、来源井、配置摘要和处理域的采样定义 |
 | `wavelet_candidate_aggregate.csv` | 判断候选竞争关系时 | 候选子波的空间去偏聚合指标和综合分数 |
 | `evaluation_well_spatial_clusters.csv` | 检查密井平台是否被去偏时 | 每口评测井的空间簇编号和簇大小 |
 | `run_summary.json` | 复现实验时 | 输入路径、候选数、评测井数、选择模式和配置快照 |
@@ -216,7 +228,7 @@ Output: scripts/output/wavelet_generation_<timestamp>
 Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 ```
 
-`selection_mode` 告诉你最终输出了什么：`optimized_consensus`（成功生成新子波）、`existing_candidate_wins`（生成子波没有超过候选）、`insufficient_eval_fallback`（井太少，降级选择）。
+`selection_mode` 告诉你最终输出了什么：`optimized_consensus`（成功生成新子波）或 `existing_candidate_wins`（生成子波没有超过候选）。
 
 ### 第二步：看 `selected_wavelet_summary.json`
 
@@ -269,4 +281,4 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 | `No evaluation wells are available` | 第四步没有标定成功的井 | 检查第四步 `well_tie_metrics.csv` 的 `tie_status` |
 | `No finite candidate wavelet metrics were produced` | 所有候选在所有井上的评测都失败了 | 检查子波采样间隔是否与地震道一致 |
 | `wavelet dt does not match seismic trace dt` | 某条子波的采样间隔和地震道不一致 | 检查第四步子波是否是用正确的地震采样间隔导出的 |
-| `insufficient_eval_fallback`（降级） | 评测井少于 `min_eval_well_count`，脚本降级为选最佳候选 | 检查第四步成功率；如果井确实少，这是预期行为 |
+| 评测井数量不足 | 评测井少于 `min_eval_well_count`，运行直接报错 | 检查第四步成功率和 `evaluation_wells` 筛选范围 |

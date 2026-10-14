@@ -31,6 +31,7 @@ from cup.config.artifacts import CONTRACT_FINGERPRINT_SCHEMA, contract_fingerpri
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
+from cup.synthetic.core.calibration import WellZoneCurves
 from cup.utils.statistics import radius_connected_components
 from cup.well.inventory import normalize_well_name
 from cup.well.las import read_las_curve
@@ -44,45 +45,48 @@ def _required_file(path_value: Any, *, repo_root: Path, label: str) -> Path:
     return path
 
 
-def _load_step5_shifted_las_sources(
+def _load_step4_aligned_las_sources(
     metrics_path: Path,
     *,
     repo_root: Path,
 ) -> list[dict[str, Any]]:
     metrics = pd.read_csv(metrics_path)
+    plans = pd.read_csv(metrics_path.parent / "well_tie_plan.csv").set_index("well_name")
     required = {
         "well_name",
-        "status",
-        "shifted_preprocessed_las_path",
-        "shifted_filtered_las_path",
+        "tie_status",
+        "filtered_las_file",
+        "aligned_depth_file",
     }
     missing = sorted(required - set(metrics.columns))
     if missing:
-        raise ValueError(f"Step 5 wavelet_batch_metrics.csv lacks columns: {missing}")
+        raise ValueError(f"Step 4 well_tie_metrics.csv lacks columns: {missing}")
     rows: list[dict[str, Any]] = []
     for row in metrics.to_dict(orient="records"):
-        if str(row.get("status", "")).casefold() != "ok":
+        if str(row.get("tie_status", "")).casefold() != "success":
             continue
         well_name = str(row["well_name"])
         full_path = _required_file(
-            row["shifted_preprocessed_las_path"],
+            plans.loc[well_name, "input_las"],
             repo_root=repo_root,
-            label=f"{well_name} shifted_preprocessed_las",
+            label=f"{well_name} preprocessed LAS",
         )
         filtered_path = _required_file(
-            row["shifted_filtered_las_path"],
+            row["filtered_las_file"],
             repo_root=repo_root,
-            label=f"{well_name} shifted_filtered_las",
+            label=f"{well_name} filtered LAS",
         )
         rows.append(
             {
                 "well_id": well_name,
                 "full_las_path": repo_relative_path(full_path, root=repo_root),
                 "filtered_las_path": repo_relative_path(filtered_path, root=repo_root),
+                "aligned_depth_file": repo_relative_path(_required_file(row["aligned_depth_file"], repo_root=repo_root,
+                                                     label=f"{well_name} aligned depth"), root=repo_root),
             }
         )
     if not rows:
-        raise ValueError("Step 5 wavelet_batch_metrics.csv has no successful shifted LAS wells.")
+        raise ValueError("Step 4 well_tie_metrics.csv has no successful aligned wells.")
     return rows
 
 
@@ -239,8 +243,8 @@ def _legacy_run_depth_calibration(
     input_inventory_path = sources["rock_physics_analysis_dir"] / "well_input_inventory.csv"
     if not input_inventory_path.is_file():
         raise FileNotFoundError(input_inventory_path)
-    step5_metrics_path = sources["wavelet_batch_synthetic_depth_dir"] / "wavelet_batch_metrics.csv"
-    shifted_las_sources = _load_step5_shifted_las_sources(step5_metrics_path, repo_root=repo_root)
+    step4_metrics_path = sources["well_auto_tie_dir"] / "well_tie_metrics.csv"
+    aligned_las_sources = _load_step4_aligned_las_sources(step4_metrics_path, repo_root=repo_root)
 
     survey, target_zone, horizon_paths = _survey_and_target_zone(
         workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
@@ -259,10 +263,10 @@ def _legacy_run_depth_calibration(
     )
     well_tops = import_well_tops_petrel(well_tops_path)
     clusters_source = []
-    for item in shifted_las_sources:
+    for item in aligned_las_sources:
         key = normalize_well_name(str(item["well_id"]))
         if key not in inventory.index:
-            raise ValueError(f"Step 5 successful well is absent from Step 1 inventory: {item['well_id']}")
+            raise ValueError(f"Step 4 successful well is absent from Step 1 inventory: {item['well_id']}")
         row = inventory.loc[key]
         x, y = float(row["surface_x"]), float(row["surface_y"])
         if not np.isfinite(x) or not np.isfinite(y):
@@ -280,19 +284,19 @@ def _legacy_run_depth_calibration(
     horizon_audit: list[dict[str, Any]] = []
     background_qc: list[dict[str, Any]] = []
     background_samples: list[dict[str, Any]] = []
-    for source in shifted_las_sources:
+    for source in aligned_las_sources:
         well_name = str(source["well_id"])
         key = normalize_well_name(well_name)
         row = inventory.loc[key]
         full_las_path = _required_file(
             source["full_las_path"],
             repo_root=repo_root,
-            label=f"{well_name} shifted_preprocessed_las",
+            label=f"{well_name} preprocessed LAS",
         )
         filtered_las_path = _required_file(
             source["filtered_las_path"],
             repo_root=repo_root,
-            label=f"{well_name} shifted_filtered_las",
+            label=f"{well_name} filtered LAS",
         )
         kb_m = float(row["kb_m"])
         il = float(row["inline_float"])
@@ -317,10 +321,19 @@ def _legacy_run_depth_calibration(
             )
         full_md = np.asarray(full_ai.basis, dtype=np.float64)
         filtered_md = np.asarray(filtered_ai.basis, dtype=np.float64)
-        full_tvdss = full_md - kb_m
-        filtered_tvdss = filtered_md - kb_m
-        full_values = np.asarray(full_ai.values, dtype=np.float64)
-        filtered_values = np.asarray(filtered_ai.values, dtype=np.float64)
+        alignment = pd.read_csv(_required_file(source["aligned_depth_file"],repo_root=repo_root,label="aligned depth"))
+        aligned_depth = alignment.tvdss_m.to_numpy(dtype=np.float64)
+        aligned_md = alignment.md_m.to_numpy(dtype=np.float64)
+        finite = np.isfinite(aligned_depth) & np.isfinite(aligned_md)
+        aligned_depth, aligned_md = aligned_depth[finite], aligned_md[finite]
+        if aligned_md.size < 2 or np.any(np.diff(aligned_md)<=0) or np.any(np.diff(aligned_depth)<=0):
+            raise ValueError(f"{well_name}: aligned depth mapping must be strictly increasing.")
+        full_tvdss = np.interp(full_md,aligned_md,aligned_depth,left=np.nan,right=np.nan)
+        filtered_tvdss = np.interp(filtered_md,aligned_md,aligned_depth,left=np.nan,right=np.nan)
+        full_keep, filtered_keep = np.isfinite(full_tvdss), np.isfinite(filtered_tvdss)
+        full_values = np.asarray(full_ai.values, dtype=np.float64)[full_keep]
+        filtered_values = np.asarray(filtered_ai.values, dtype=np.float64)[filtered_keep]
+        full_tvdss, filtered_tvdss = full_tvdss[full_keep], filtered_tvdss[filtered_keep]
         tops: dict[str, tuple[float, float]] = {}
         for horizon in script_cfg["horizons"]:
             name = str(horizon["name"])
@@ -339,7 +352,9 @@ def _legacy_run_depth_calibration(
                     "status": "not_contributed", "reason": str(exc),
                 })
                 continue
-            top_tvdss = top_md - kb_m
+            top_tvdss = float(np.interp(top_md,aligned_md,aligned_depth,left=np.nan,right=np.nan))
+            if not np.isfinite(top_tvdss):
+                continue
             # Interpretation support failures are structural and must not be
             # downgraded to a missing-well-top contribution.
             sample = target_zone.get_horizon_surface(name).sample_at_line(il, xl)
@@ -424,7 +439,6 @@ def _legacy_run_depth_calibration(
     input_contracts = {
         key.removesuffix("_dir"): {
             "path": repo_relative_path(sources[key] / "run_summary.json", root=repo_root),
-            "contract_fingerprint_sha256": str(value["contract_fingerprint_sha256"]),
         }
         for key, value in source_provenance.items()
     }
@@ -461,12 +475,12 @@ def _legacy_run_depth_calibration(
         "source_provenance": dict(source_provenance),
         "config_provenance": dict(config_provenance),
         "locked_step3_run": locked_step3_run,
-        "locked_step5_run": repo_relative_path(sources["wavelet_batch_synthetic_depth_dir"], root=repo_root),
+        "locked_step4_run": repo_relative_path(sources["well_auto_tie_dir"], root=repo_root),
         "well_curve_source_contract": {
-            "full_log_ai": "Step 5 shifted_preprocessed_las/AI",
-            "filtered_log_ai": "Step 5 shifted_filtered_las/AI, used for background fitting",
+            "full_log_ai": "Step 3 preprocessed LAS/AI on Step 4 aligned depth",
+            "filtered_log_ai": "Step 4 filtered LAS/AI on aligned depth, used for background fitting",
         },
-        "shifted_las_sources": shifted_las_sources,
+        "aligned_las_sources": aligned_las_sources,
     })
     relation = forward_inputs["ai_velocity_relation"]
     maximum_ai = float(np.exp(payload["generation_log_ai_bounds"]["global"]["maximum"]))

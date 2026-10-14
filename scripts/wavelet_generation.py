@@ -1,4 +1,4 @@
-"""Generate one global time-domain wavelet and batch synthetic QC.
+"""Generate one global wavelet and batch synthetic QC for time or depth seismic.
 
 The script consumes fourth-step ``well_auto_tie`` outputs.  It evaluates all
 usable per-well wavelets on the same fixed optimized TDT/seismic artifacts,
@@ -16,6 +16,7 @@ import argparse
 import json
 import sys
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -33,13 +34,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.config.workflow import WorkflowConfig, merge_dict_defaults
+from cup.config.workflow import WorkflowConfig, load_workflow_config, merge_dict_defaults
 from cup.config.sources import resolve_source_run
-from cup.config.artifacts import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
-    published_contract_reference,
-)
 from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
@@ -58,6 +54,8 @@ from cup.well.tie import (
     evaluate_wavelet_on_well,
     load_tie_artifacts,
     prepare_well_for_evaluation,
+    prepare_depth_tie_sampling,
+    map_time_qc_to_depth,
 )
 from cup.seismic.wavelet import (
     infer_wavelet_dt,
@@ -66,13 +64,13 @@ from cup.seismic.wavelet import (
     wavelet_roughness,
     wavelet_spectrum_features,
 )
-from cup.seismic.wavelet_consensus import ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
+from cup.seismic.wavelet_consensus import WAVELET_GENERATION_SCHEMA_VERSION, ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
 from wtie.modeling.modeling import ConvModeler
 from wtie.optimize import tie as tie_ops
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
-SCHEMA_VERSION = "wavelet_generation_v2"
+SCHEMA_VERSION = WAVELET_GENERATION_SCHEMA_VERSION
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,7 +147,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "scoring",
-        {"min_eval_well_count": 3, "on_insufficient_eval_wells": "select_best_source_tie"},
+        {"min_eval_well_count": 3, "on_insufficient_eval_wells": "error"},
     )
     return script_cfg
 
@@ -371,7 +369,7 @@ def _evaluate_wavelet_on_all_wells(
     clusters_df: pd.DataFrame,
     modeler: Any,
     output_qc_dir: Path | None = None,
-    well_cache: dict[str, tuple[Any, Any, grid.Log]] | None = None,
+    well_cache: dict[str, tuple[Any, ...]] | None = None,
 ) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
     metrics: list[WaveletWellMetric] = []
     qcs: list[pd.DataFrame] = []
@@ -389,12 +387,19 @@ def _evaluate_wavelet_on_all_wells(
                 seismic_match=precomputed[0] if precomputed is not None else None,
                 reflectivity_match=precomputed[1] if precomputed is not None else None,
             )
-            metrics.append(metric)
             qc = qc.copy()
-            qc.insert(0, "well_name", well.well_name)
-            qc.insert(1, "candidate_wavelet", wavelet_name)
             if precomputed is not None and len(precomputed) >= 3:
                 qc["ai"] = precomputed[2].values
+            if well.sample_domain == "depth":
+                sampling = precomputed[3] if precomputed is not None and len(precomputed) > 3 else prepare_depth_tie_sampling(well, qc.twt_s.to_numpy())
+                qc, depth_metrics = map_time_qc_to_depth(qc, sampling)
+                metric = replace(metric, corr=depth_metrics["corr"], nmae=depth_metrics["nmae"],
+                                 scale=float(metric.scale)*depth_metrics["scale_multiplier"],
+                                 n_eval_samples=depth_metrics["n_eval_samples"])
+            metrics.append(metric)
+            qc.insert(0, "well_name", well.well_name)
+            qc.insert(1, "candidate_wavelet", wavelet_name)
+            qc.insert(2, "sample_domain", well.sample_domain)
             qcs.append(qc)
             if output_qc_dir is not None:
                 safe = sanitize_filename(f"{wavelet_name}_{well.well_name}")
@@ -415,6 +420,8 @@ def _evaluate_wavelet_on_all_wells(
                 )
             )
     metrics_df = _join_clusters(pd.DataFrame.from_records(_metric_rows(metrics)), clusters_df)
+    domain_by_well = {well.well_name: well.sample_domain for well in wells}
+    metrics_df["sample_domain"] = metrics_df["eval_well"].map(domain_by_well)
     return metrics_df, qcs
 
 
@@ -497,22 +504,27 @@ def _plot_batch_synthetic_qc(
     path: Path,
     *,
     horizon_markers: Sequence[tuple[float, str]] = (),
+    sample_domain: str = "time",
 ) -> None:
     if qc.empty:
         return
-    twt_s = qc["twt_s"].to_numpy(dtype=np.float64)
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError("Batch QC requires an explicit time or depth sample domain.")
+    is_depth = sample_domain == "depth"
+    basis_type = "tvdss" if is_depth else "twt"
+    twt_s = qc["tvdss_m" if is_depth else "twt_s"].to_numpy(dtype=np.float64)
     reflectivity = qc["reflectivity"].to_numpy(dtype=np.float64)
     seismic_norm = qc["seismic_norm"].to_numpy(dtype=np.float64)
     synthetic = qc["synthetic_scaled"].to_numpy(dtype=np.float64)
     residual = qc["residual"].to_numpy(dtype=np.float64)
     ai_values = qc["ai"].to_numpy(dtype=np.float64) if "ai" in qc.columns else np.full_like(twt_s, np.nan)
 
-    synthetic_trace = grid.Seismic(synthetic, twt_s, "twt", name="Synthetic")
-    seismic_trace = grid.Seismic(seismic_norm, twt_s, "twt", name="Seismic")
+    synthetic_trace = grid.Seismic(synthetic, twt_s, basis_type, name="Synthetic")
+    seismic_trace = grid.Seismic(seismic_norm, twt_s, basis_type, name="Seismic")
     xcorr_values = normalized_xcorr(seismic_trace.values, synthetic_trace.values)
     xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
-    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
-    dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "zlag" if is_depth else "tlag", name="XCorr")
+    dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace, window_lenght=75.0 if is_depth else .070)
     title = None
     if metrics_row is not None:
         corr = float(metrics_row["corr"]) if pd.notna(metrics_row.get("corr")) else np.nan
@@ -520,8 +532,8 @@ def _plot_batch_synthetic_qc(
         scale = float(metrics_row["scale"]) if pd.notna(metrics_row.get("scale")) else np.nan
         title = f"Batch synthetic | corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}"
     fig, _axes = plot_well_waveform_qc(
-        grid.Log(ai_values, twt_s, "twt", name="AI"),
-        grid.Reflectivity(reflectivity, twt_s, "twt", name="Reflectivity"),
+        grid.Log(ai_values, twt_s, basis_type, name="AI"),
+        grid.Reflectivity(reflectivity, twt_s, basis_type, name="Reflectivity"),
         synthetic_trace,
         seismic_trace,
         xcorr,
@@ -534,27 +546,29 @@ def _plot_batch_synthetic_qc(
     plt.close(fig)
 
 
-def _tie_horizon_markers_by_well(auto_tie_dir: Path) -> dict[str, list[tuple[float, str]]]:
+def _tie_horizon_markers_by_well(auto_tie_dir: Path, domain: str = "time") -> dict[str, list[tuple[float, str]]]:
     path = auto_tie_dir / "tie_window_report.csv"
     if not path.exists():
         return {}
     rows = pd.read_csv(path)
+    top_column = "target_top_tvdss_m" if domain == "depth" else "target_top_twt_s"
+    bottom_column = "target_bottom_tvdss_m" if domain == "depth" else "target_bottom_twt_s"
     required = {
         "well_name",
         "target_top_name",
         "target_bottom_name",
-        "target_top_twt_s",
-        "target_bottom_twt_s",
+        top_column,
+        bottom_column,
     }
     if not required.issubset(rows.columns):
         return {}
     return {
         normalize_well_name(str(row["well_name"])): [
-            (float(row["target_top_twt_s"]), str(row["target_top_name"])),
-            (float(row["target_bottom_twt_s"]), str(row["target_bottom_name"])),
+            (float(row[top_column]), str(row["target_top_name"])),
+            (float(row[bottom_column]), str(row["target_bottom_name"])),
         ]
         for _, row in rows.iterrows()
-        if pd.notna(row["target_top_twt_s"]) and pd.notna(row["target_bottom_twt_s"])
+        if pd.notna(row[top_column]) and pd.notna(row[bottom_column])
     }
 
 
@@ -564,6 +578,7 @@ def _write_batch_synthetic_qc_figures(
     output_dir: Path,
     *,
     horizon_markers_by_well: dict[str, list[tuple[float, str]]] | None = None,
+    sample_domain: str = "time",
 ) -> list[str]:
     metric_by_well = {
         normalize_well_name(str(row["eval_well"])): row
@@ -584,6 +599,7 @@ def _write_batch_synthetic_qc_figures(
             metric_by_well.get(key),
             path,
             horizon_markers=(horizon_markers_by_well or {}).get(key, ()),
+            sample_domain=sample_domain,
         )
         figure_paths.append(repo_relative_path(path, root=REPO_ROOT))
     return figure_paths
@@ -591,7 +607,7 @@ def _write_batch_synthetic_qc_figures(
 
 def main() -> None:
     args = parse_args()
-    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    cfg = load_workflow_config(args.config, repo_root=REPO_ROOT)
     workflow = WorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
     if args.well is not None:
@@ -603,6 +619,10 @@ def main() -> None:
     write_debug_artifacts = bool(args.debug)
 
     index = load_tie_artifacts(source_dirs["auto_tie_dir"], repo_root=REPO_ROOT)
+    with (source_dirs["auto_tie_dir"] / "run_summary.json").open(encoding="utf-8") as handle:
+        tie_summary = json.load(handle)
+    if tie_summary.get("sample_domain") != workflow.seismic.domain or tie_summary.get("depth_basis") != workflow.seismic.depth_basis:
+        raise ValueError("Fourth-step seismic domain does not match the workflow.")
     candidate_filter = dict(script_cfg["candidate_filter"])
     candidates = index.candidate_wavelets(
         min_source_tie_corr=candidate_filter.get("min_source_tie_corr"),
@@ -610,16 +630,19 @@ def main() -> None:
         include_source_wells=set(candidate_filter["include_source_wells"]) if candidate_filter.get("include_source_wells") is not None else None,
         exclude_source_wells=set(candidate_filter.get("exclude_source_wells") or []),
     )
+    candidates = [candidate for candidate in candidates if workflow.well_usage.role_for(candidate.source_well) == "trusted"]
     pool, qc_rows, wavelet_time_s, wavelet_matrix = _load_candidate_wavelet_pool(candidates, script_cfg)
 
     wells = index.evaluation_wells(status="success")
+    wells = [well for well in wells if workflow.well_usage.role_for(well.well_name) == "trusted"]
     wells = _filter_by_well_names(wells, dict(script_cfg["evaluation_wells"]))
     min_eval_well_count = int(script_cfg["scoring"]["min_eval_well_count"])
-    insufficient_eval_wells = len(wells) < min_eval_well_count
     insufficient_policy = str(script_cfg["scoring"].get("on_insufficient_eval_wells", "error"))
     if not wells:
         raise ValueError("No evaluation wells are available for global wavelet generation.")
-    if insufficient_eval_wells and insufficient_policy != "select_best_source_tie":
+    if insufficient_policy != "error":
+        raise ValueError("scoring.on_insufficient_eval_wells must be error.")
+    if len(wells) < min_eval_well_count:
         raise ValueError(f"Too few evaluation wells: {len(wells)} < {min_eval_well_count}")
 
     clusters_df = build_well_spatial_clusters(wells, radius_m=workflow.spatial_debias.cluster_radius_m)
@@ -639,10 +662,14 @@ def main() -> None:
 
     modeler = ConvModeler()
     wavelet_dt_s = infer_wavelet_dt(wavelet_time_s)
-    well_cache: dict[str, tuple[Any, Any, grid.Log]] = {
+    well_cache: dict[str, tuple[Any, ...]] = {
         normalize_well_name(well.well_name): _prepare_well_for_evaluation_with_ai(well, dt_s=wavelet_dt_s)
         for well in wells
     }
+    if workflow.seismic.domain == "depth":
+        well_cache = {normalize_well_name(well.well_name): (*well_cache[normalize_well_name(well.well_name)],
+                      prepare_depth_tie_sampling(well, well_cache[normalize_well_name(well.well_name)][0].basis))
+                      for well in wells}
     candidate_metric_frames = []
     for item in pool:
         metrics_df, _ = _evaluate_wavelet_on_all_wells(
@@ -687,108 +714,79 @@ def main() -> None:
     best_candidate_name = str(best_candidate_row["candidate_wavelet"])
     best_candidate_item = next(item for item in pool if item["name"] == best_candidate_name)
     best_candidate_score = float(best_candidate_row["score"])
-    if insufficient_eval_wells:
-        best_candidate_item = max(
-            pool,
-            key=lambda item: (
-                -np.inf
-                if item["candidate"].tie_corr is None or not np.isfinite(float(item["candidate"].tie_corr))
-                else float(item["candidate"].tie_corr),
-                -np.inf
-                if item["candidate"].tie_nmae is None or not np.isfinite(float(item["candidate"].tie_nmae))
-                else -float(item["candidate"].tie_nmae),
-            ),
-        )
-        best_candidate_name = str(best_candidate_item["name"])
-        if best_candidate_item["candidate"].tie_corr is not None:
-            best_candidate_score = float(best_candidate_item["candidate"].tie_corr)
-
     consensus_wavelet = basis.mean_wavelet
     consensus_score = float("nan")
-    if insufficient_eval_wells:
-        if write_debug_artifacts:
-            pd.DataFrame(columns=["trial_id", "score", "status", "reason", "selected"]).to_csv(
-                output_dir / "consensus_search_trials.csv",
-                index=False,
-            )
-            pd.DataFrame().to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
-        selected_name = best_candidate_name
-        selected_source = best_candidate_item["candidate"].source_well
-        selected_wavelet = best_candidate_item["amplitude"]
-        selected_score = best_candidate_score
-        selection_mode = "insufficient_eval_fallback"
-    else:
-        def consensus_evaluator(values: np.ndarray) -> dict[str, float]:
-            reg = _regularization_for_wavelet(
-                values,
-                mean_wavelet=basis.mean_wavelet,
-                mean_features=mean_features,
-                time_s=wavelet_time_s,
-            )
-            metrics_df, _ = _evaluate_wavelet_on_all_wells(
-                wavelet_name="optimized_consensus_trial",
-                source_well="optimized_consensus",
-                wavelet_time_s=wavelet_time_s,
-                wavelet_amplitude=values,
-                wells=wells,
-                clusters_df=clusters_df,
-                modeler=modeler,
-                well_cache=well_cache,
-            )
-            aggregate = _aggregate_metrics(metrics_df)
-            if aggregate.empty:
-                return {"score": float("-inf")}
-            row = aggregate.iloc[0]
-            score = _score_from_aggregate(row, script_cfg, regularization=reg)
-            out = {key: float(value) for key, value in row.items() if isinstance(value, (int, float, np.integer, np.floating))}
-            out.update(reg)
-            out["score"] = score
-            return out
-
-        optimizer_cfg = dict(script_cfg["generation"]["optimizer"])
-        consensus_result = optimize_consensus_wavelet(
-            basis,
-            consensus_evaluator,
-            policy=ConsensusSearchPolicy(
-                random_trials=int(optimizer_cfg["random_trials"]),
-                max_refine_iters=int(optimizer_cfg["max_refine_iters"]),
-                seed=optimizer_cfg.get("seed"),
-                score_key="score",
-            ),
+    def consensus_evaluator(values: np.ndarray) -> dict[str, float]:
+        reg = _regularization_for_wavelet(
+            values,
+            mean_wavelet=basis.mean_wavelet,
+            mean_features=mean_features,
+            time_s=wavelet_time_s,
         )
-        if write_debug_artifacts:
-            pd.DataFrame.from_records([trial.to_row() for trial in consensus_result.trials]).to_csv(
-                output_dir / "consensus_search_trials.csv",
-                index=False,
-            )
-
-        consensus_metrics_df, _ = _evaluate_wavelet_on_all_wells(
-            wavelet_name="optimized_consensus",
+        metrics_df, _ = _evaluate_wavelet_on_all_wells(
+            wavelet_name="optimized_consensus_trial",
             source_well="optimized_consensus",
             wavelet_time_s=wavelet_time_s,
-            wavelet_amplitude=consensus_result.wavelet,
+            wavelet_amplitude=values,
             wells=wells,
             clusters_df=clusters_df,
             modeler=modeler,
             well_cache=well_cache,
         )
-        if write_debug_artifacts:
-            consensus_metrics_df.to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
-        consensus_score = float(consensus_result.score)
-        consensus_wavelet = consensus_result.wavelet
+        aggregate = _aggregate_metrics(metrics_df)
+        if aggregate.empty:
+            return {"score": float("-inf")}
+        row = aggregate.iloc[0]
+        score = _score_from_aggregate(row, script_cfg, regularization=reg)
+        out = {key: float(value) for key, value in row.items() if isinstance(value, (int, float, np.integer, np.floating))}
+        out.update(reg)
+        out["score"] = score
+        return out
 
-        if np.isfinite(consensus_score) and consensus_score > best_candidate_score:
-            selected_name = "optimized_consensus"
-            selected_source = "optimized_consensus"
-            selected_wavelet = consensus_result.wavelet
-            selected_score = consensus_score
-            selection_mode = "optimized_consensus"
-        else:
-            selected_name = best_candidate_name
-            selected_source = best_candidate_item["candidate"].source_well
-            selected_wavelet = best_candidate_item["amplitude"]
-            selected_score = best_candidate_score
-            selection_mode = "existing_candidate_wins"
+    optimizer_cfg = dict(script_cfg["generation"]["optimizer"])
+    consensus_result = optimize_consensus_wavelet(
+        basis,
+        consensus_evaluator,
+        policy=ConsensusSearchPolicy(
+            random_trials=int(optimizer_cfg["random_trials"]),
+            max_refine_iters=int(optimizer_cfg["max_refine_iters"]),
+            seed=optimizer_cfg.get("seed"),
+            score_key="score",
+        ),
+    )
+    if write_debug_artifacts:
+        pd.DataFrame.from_records([trial.to_row() for trial in consensus_result.trials]).to_csv(
+            output_dir / "consensus_search_trials.csv",
+            index=False,
+        )
+
+    consensus_metrics_df, _ = _evaluate_wavelet_on_all_wells(
+        wavelet_name="optimized_consensus",
+        source_well="optimized_consensus",
+        wavelet_time_s=wavelet_time_s,
+        wavelet_amplitude=consensus_result.wavelet,
+        wells=wells,
+        clusters_df=clusters_df,
+        modeler=modeler,
+        well_cache=well_cache,
+    )
+    if write_debug_artifacts:
+        consensus_metrics_df.to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
+    consensus_score = float(consensus_result.score)
+    consensus_wavelet = consensus_result.wavelet
+
+    if np.isfinite(consensus_score) and consensus_score > best_candidate_score:
+        selected_name = "optimized_consensus"
+        selected_source = "optimized_consensus"
+        selected_wavelet = consensus_result.wavelet
+        selected_score = consensus_score
+        selection_mode = "optimized_consensus"
+    else:
+        selected_name = best_candidate_name
+        selected_source = best_candidate_item["candidate"].source_well
+        selected_wavelet = best_candidate_item["amplitude"]
+        selected_score = best_candidate_score
+        selection_mode = "existing_candidate_wins"
 
     selected_wavelet_path = output_dir / "selected_wavelet.csv"
     pd.DataFrame({"time_s": wavelet_time_s, "amplitude": selected_wavelet}).to_csv(selected_wavelet_path, index=False)
@@ -808,14 +806,19 @@ def main() -> None:
         batch_qcs,
         batch_metrics_df,
         output_dirs["batch_synthetic_qc_figures"],
-        horizon_markers_by_well=_tie_horizon_markers_by_well(source_dirs["auto_tie_dir"]),
+        horizon_markers_by_well=_tie_horizon_markers_by_well(source_dirs["auto_tie_dir"], workflow.seismic.domain),
+        sample_domain=workflow.seismic.domain,
     )
     plot_wavelets = {"selected": selected_wavelet, "best_candidate": best_candidate_item["amplitude"]}
-    plot_wavelets["mean_of_candidates" if selection_mode == "insufficient_eval_fallback" else "consensus"] = consensus_wavelet
+    plot_wavelets["consensus"] = consensus_wavelet
     _plot_wavelets(wavelet_time_s, plot_wavelets, output_dirs["figures"] / "selected_wavelet.png")
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "success",
+        "sample_domain": workflow.seismic.domain,
+        "sample_unit": "s" if workflow.seismic.domain == "time" else "m",
+        "depth_basis": workflow.seismic.depth_basis,
+        "well_usage": workflow.well_usage.as_dict(),
         "selection_mode": selection_mode,
         "selected_wavelet": selected_name,
         "selected_source_well": selected_source,
@@ -832,33 +835,7 @@ def main() -> None:
         "batch_synthetic_qc_figure_count": len(batch_qc_figure_paths),
     }
     write_json(output_dir / "selected_wavelet_summary.json", summary)
-    input_contracts = {
-        "well_auto_tie": published_contract_reference(
-            source_dirs["auto_tie_dir"] / "run_summary.json",
-            root=REPO_ROOT,
-            label=f"well auto-tie run {source_dirs['auto_tie_dir']}",
-        )
-    }
-    primary_names = (
-        "selected_wavelet.csv",
-        "selected_wavelet_summary.json",
-        "batch_synthetic_metrics.csv",
-        "wavelet_candidate_aggregate.csv",
-        "evaluation_well_spatial_clusters.csv",
-    )
-    primary_artifacts = {
-        name: output_dir / name for name in primary_names if (output_dir / name).is_file()
-    }
     run_summary = {"config": script_cfg, **summary}
-    run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
-    run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version=SCHEMA_VERSION,
-        semantics={"sample_domain": "time", "sample_unit": "s", "selection_mode": selection_mode},
-        business_config=script_cfg,
-        input_contracts=input_contracts,
-        primary_artifacts=primary_artifacts,
-    )
-    run_summary["input_contracts"] = input_contracts
     write_json(output_dir / "run_summary.json", run_summary)
 
     print("=== Global Wavelet Generation ===")

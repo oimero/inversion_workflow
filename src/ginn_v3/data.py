@@ -739,6 +739,8 @@ def build_well_targets(
     support_by_name = {str(name).casefold(): support for name, support in evaluation_supports.items()}
     targets: dict[str, WellTarget] = {}
     for control in controls.controls:
+        if control.well_role != "trusted":
+            continue
         if str(control.wellbore_class).strip().casefold() == "deviated":
             continue
         key, trace_weights = _control_trace_weights(control, geometry)
@@ -842,7 +844,7 @@ def prepare_training_data(
     lfm_mask: np.ndarray,
     controls: WellControlSet,
     evaluation_supports: Mapping[str, EvaluationSupport],
-    trusted_well_names: Iterable[str],
+    trusted_well_names: Iterable[str] | None,
     config: TrainingConfig,
     velocity_mps: np.ndarray | None = None,
     normalization: Normalization | None = None,
@@ -864,12 +866,21 @@ def prepare_training_data(
         lfm_mask=masks,
         evaluation_supports=evaluation_supports,
     )
-    trusted_names = tuple(str(name) for name in trusted_well_names)
+    if trusted_well_names is None:
+        trusted_names = tuple(control.well_name for control in controls.controls if control.well_role == "trusted")
+    else:
+        trusted_names = tuple(str(name) for name in trusted_well_names)
     if not trusted_names:
         raise ValueError("At least one trusted well is required for v3 training.")
     trusted_keys = {name.casefold() for name in trusted_names}
     if len(trusted_keys) != len(trusted_names):
         raise ValueError("Trusted well names must be unique case-insensitively.")
+    non_trusted = sorted(
+        name for name in trusted_names
+        if controls.role_for(name) != "trusted"
+    )
+    if non_trusted:
+        raise ValueError(f"GINN supervision may only use trusted wells: {non_trusted}")
     unknown = sorted(trusted_keys - {name.casefold() for name in targets})
     if unknown:
         raise ValueError(f"Trusted wells are unknown or invalid: {unknown}")

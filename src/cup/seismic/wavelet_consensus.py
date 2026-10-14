@@ -15,6 +15,8 @@ import pandas as pd
 
 from cup.seismic.wavelet import wavelet_l2_normalize
 
+WAVELET_GENERATION_SCHEMA_VERSION = "wavelet_generation_v3"
+
 
 def aggregate_cluster_then_global(
     df: pd.DataFrame,

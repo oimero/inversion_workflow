@@ -1,401 +1,282 @@
 # 深度域工作流
 
-深度域工作流复用井资产盘点、测井曲线筛选、测井预处理、岩石物理分析、井控集和低频模型构建。第四步提取单井固定子波，第五步使用该子波进行全井合成与深度平移。
+深度域工作流使用与时间域相同的步骤入口。地震体的 `domain` 决定各步骤的采样轴；深度域额外提供深度基准，并在井震标定阶段用本井纵波速度建立局部时深关系。
+
+前三步准备井资产、曲线筛选和测井预处理。第四步和第五步完成井震标定与共识子波生成，第六步整理井控数据，第七步建立低频模型，第八步执行物理约束神经网络反演。深度域专属的坐标转换、单位和正演输入在本页说明，其余配置见各步骤主指南。
 
 ---
 
 ## 总览
 
-时间域和深度域分别执行第四、第五步：
-
-- 时间域第4步做全井自动标定，输出每井候选子波；
-- 深度域第4步只跑一口指定井，输出一条固定子波；
-- 时间域第5步做全井交叉评测和共识子波优化；
-- 深度域第5步用固定子波做全井时移扫描和深度平移 LAS 导出。
-
----
-
-## 第 4 步：固定子波提取
-
-第四步针对一口指定井提取固定时间子波，供后续批量合成使用。深度换算采用直井近似：钻井测量深度减去补心高程，得到相对海平面的垂向深度。
-
-### 快速开始
-
-```powershell
-python scripts/vertical_well_auto_tie_depth.py --config "<config-yaml>" --well "<source-well>"
-python scripts/vertical_well_auto_tie_depth.py --config "<config-yaml>" --well "<source-well>" --output-dir "<tie-output-dir>"
+```mermaid
+flowchart TB
+    S1["01 井资产盘点"] --> S2["02 LAS 曲线筛选与导出"] --> S3["03 测井预处理"] --> S4["04 井震自动标定"] --> S5["05 全局共识子波生成"] --> S6["06 真实工区井控数据集"] --> S7["07 真实工区低频模型"] --> S8["08 物理约束神经网络反演"]
+    S3 -.-> RP["旁路 岩石物理分析"]
+    S1 -.-> WT["旁路 井轨迹 QC"]
+    WT -.-> S4
 ```
 
-### 配置参考
-
-配置位于 `vertical_well_auto_tie_depth` 段。尖括号内容替换为本地路径或井名；以下数值展示搜索范围的配置形式，实际范围需结合测井采样间隔和振幅尺度设置。
-
-```yaml
-vertical_well_auto_tie_depth:
-  well_name: "<source-well>"        # 子波来源井
-  source_runs:
-    well_preprocess_dir: "<preprocess-run-dir>"  # 留空时自动发现第三步产物
-  las_vp_unit: us/m                 # DT 单位
-  las_rho_unit: g/cm3               # 密度单位
-  target_crop_ms: 201.0             # 最终子波目标长度 (ms)
-
-  tutorial_model: "<pretrained-model-file>"       # 相对数据根目录的模型路径
-  tutorial_params: "<network-parameters-file>"    # 相对数据根目录的参数路径
-
-  search_space:                     # autotie 搜索空间定义
-    logs_median_size_values: [3, 5, 7, 9, 11, 15, 21]
-    logs_median_threshold_bounds: [0.05, 0.25]
-    logs_std_bounds: [0.05, 0.35]
-    table_t_shift_bounds: [-0.04, 0.04]
-
-  search_params:                    # autotie 搜索参数
-    num_iters: 80
-    similarity_std: 0.1
-
-  wavelet_scaling:                  # 子波振幅缩放
-    min_scale: 0.5
-    max_scale: 2.0
-    num_iters: 20
-```
-
-测井预处理运行目录相对仓库根目录解析。来源目录留空时，脚本在配置的输出根目录内查找第三步产物。预训练模型和网络参数文件相对数据根目录解析。
-
-此外还需顶层 `seismic` 段声明深度域：
+深度域运行时，公共配置至少包含：
 
 ```yaml
 seismic:
+  file: <seismic-volume-file>
+  type: <seismic-file-type>
   domain: depth
   depth_basis: tvdss
-  file: "<seismic-file>"
-  type: zgy
+
+well_usage:
+  trusted_well_names:
+    - <trusted-well-a>
+    - <trusted-well-b>
+  background_only_well_names:
+    - <background-well-a>
 ```
 
-地震配置需要使用深度域和海平面以下垂深口径。文件类型按实际数据选择；读取 SEG-Y 时还需在同一配置段填写道头位置和线号步长。
+可信井参与第四步、第五步以及第八步井监督。背景井跳过第四步和第五步，由第六步直接读取第三步曲线，并参与第七步低频背景建模。两类井都要通过第三步的曲线质量检查；两份名单不能重叠。
 
-### 脚本在做什么
-
-1. **准备井曲线与井旁地震。** 读取预处理后的纵波速度和密度曲线，对其中的缺失值做线性插值，并根据井口坐标提取深度域地震道。
-
-2. **建立局部时深关系。** 按直井近似把测井深度换算到海平面以下垂深，裁取井曲线与地震道的共同深度窗。沿深度积分纵波慢度，得到双程旅行时，并以共同窗口顶部作为相对时间零点。
-
-3. **转换到规则时间轴。** 使用局部时深关系，把深度域地震插值到预训练模型要求的时间采样间隔。测井曲线也按同一时深关系转换到时间域，用于计算反射系数。
-
-4. **搜索标定参数。** 联合搜索测井去尖峰、平滑和整体时间平移参数。每组参数对应一条估计子波及卷积合成记录，通过与地震道的相似度选择结果，再估计子波的振幅尺度。
-
-5. **裁剪、归一化与评价。** 以零时刻为中心裁取目标长度的奇数样点子波，使振幅平方和为一。用裁剪子波重新生成合成记录，拟合展示用振幅尺度，计算相关系数和归一化绝对误差。输出时深关系、收敛过程、波形对比和子波频谱图。
-
-标定摘要保存每口井最终选出的去尖峰、平滑和 Gaussian 参数。这里的 Gaussian 参数属于 Wtie 标定滤波本身；第五步沿用每口井的最优滤波结果，并把对应的滤波曲线交给第六步。
-
-### 核心输出文件
-
-| 文件 | 内容 |
-|------|------|
-| `wavelet_201ms_<source-well>.csv` | 最终子波（columns: `time_s`, `amplitude`），奇数长度，能量归一化 |
-| `run_summary_<source-well>.json` | autotie 参数、重叠窗口范围、裁剪信息、合成指标 |
-| `wavelet_raw/auto_well_tie_wavelet_raw_<source-well>.csv` | 裁剪前的 raw wavelet |
-| `depth_match/local_tdt_md_<source-well>.csv` | 局部时深表（columns: `tvdss_m`, `twt_s`, `md_m`, `vp_mps`） |
-| `depth_match/seismic_twt_from_depth_<source-well>.csv` | 从深度域转到 TWT 域的地震道 |
-| `synthetic_qc/auto_well_tie_synthetic_qc_*.csv` | raw 和 cropped 合成记录 QC |
-| `figures/qc_*.png` | 5 张 QC 图 |
+深度域的纵向采样单位是米，具体基准由 `depth_basis` 指定。井震标定内部使用以秒表示的双程旅行时；学习卷积核的时间轴也按秒定义。地震体的深度采样间隔、井曲线采样间隔和学习卷积核采样间隔分别由各自产物记录，不能互相替代。
 
 ---
 
-## 第 5 步：批量合成与深度平移
-
-第五步使用第四步的固定子波与测井滤波参数，对各井计算合成记录，确定整体时间平移量，并导出深度平移后的全曲线与滤波曲线两套测井文件。
+## 第 4 步：井震自动标定
 
 ### 快速开始
 
 ```powershell
-python scripts/wavelet_batch_synthetic_depth.py --config "<config-yaml>"
-python scripts/wavelet_batch_synthetic_depth.py --config "<config-yaml>" --well "<well-name>"
-python scripts/wavelet_batch_synthetic_depth.py --config "<config-yaml>" --output-dir "<batch-output-dir>"
+python scripts/well_auto_tie.py --config <config-yaml>
+python scripts/well_auto_tie.py --config <config-yaml> --well <well-name>
+python scripts/well_auto_tie.py --config <config-yaml> --output-dir <tie-output-dir>
 ```
 
-用 `--well` 可以只跑一口井调试。
+第四步入口从 `seismic.domain` 读取当前采样域，并根据 `well_usage` 选择参与标定的井。
 
 ### 配置参考
 
-所有配置在 `wavelet_batch_synthetic_depth` 段下：
+第四步公共配置见[井震自动标定](4-well-auto-tie.md)。深度域只需将地震声明为深度域，并保证前三步来源、井轨迹、井分层和地震体属于同一工区：
 
 ```yaml
-wavelet_batch_synthetic_depth:
+well_auto_tie:
   source_runs:
-    well_preprocess_dir: "<preprocess-run-dir>"
-    vertical_well_auto_tie_depth_dir: "<tie-run-dir>"
-  las_vp_unit: us/m
-  las_rho_unit: g/cm3
-
-  source_well_name: "<source-well>"        # 与第四步保持一致
-  skip_shift_scan_well_names:             # 按配置保持零时移的井
-    - "<zero-shift-well-a>"
-    - "<zero-shift-well-b>"
-
-  shift_min_ms: -20.0                    # 时移扫描下限
-  shift_max_ms: 20.0                     # 时移扫描上限
+    well_inventory_dir: <well-inventory-run-dir>
+    well_preprocess_dir: <well-preprocess-run-dir>
+    well_trajectory_dir: <well-trajectory-run-dir>
+  target_interval:
+    top_horizon: <top-horizon-file>
+    bottom_horizon: <bottom-horizon-file>
+    margin_top_m: <top-margin-m>
+    margin_bottom_m: <bottom-margin-m>
 ```
 
-同样需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
+深度域的 `target_interval` 仍以层位对应的双程旅行时定义标定窗口。脚本先在井位读取层位深度，再通过本井局部时深关系转换到标定时间轴。
 
-默认自动接上最新一次测井预处理结果和最新一次包含指定来源井产物的深度域第4步结果。复现实验时可按需填写 `source_runs` 下对应的运行目录固定输入。
-
-脚本从发现的深度域第4步目录读取子波和 `run_summary_<source-well>.json`，并使用该次标定选出的测井中值滤波窗口、去尖峰阈值和高斯平滑标准差。摘要缺少任一参数时脚本直接报错。
+如果不使用层位文件，也可以用 `top_depth_m` 和 `bottom_depth_m` 直接给出深度边界；上下冗余使用 `margin_top_m` 和 `margin_bottom_m`，单位为米。
 
 ### 脚本在做什么
 
-1. **构造每口井的时间域输入。** 对速度和密度的缺失值做线性插值，按直井近似裁取共同深度窗，并由速度积分建立局部时深关系。使用第四步选出的去尖峰和平滑参数处理测井，计算时间域反射系数，把井旁地震转换到同一规则时间轴，并对地震振幅做标准化。
+1. **确定井的用途和路由。** 读取井资产、曲线质量、井型与工区位置。背景井和名单外井记录为跳过状态，可信井继续选择直井或斜井的处理路线。
+2. **建立本井局部时深关系。** 将测井深度转换到地震的深度基准；从纵波速度积分得到深度到双程旅行时的映射，并保存观测深度、速度和相对时间的对应关系。
+3. **建立统一标定输入。** 在井旁或沿轨迹读取深度域地震道，把地震道和井曲线按局部时深关系插值到规则时间轴。反射系数、地震道和搜索参数在这一时间轴上保持一致。
+4. **执行细标定。** 联合搜索测井去尖峰、平滑、子波尺度和整体时移，以相关系数和归一化误差评价每组结果。
+5. **回写深度结果。** 将优化后的时深关系和滤波曲线映射回观测深度，保存深度域曲线、局部时深表、原始深度映射和原生深度地震道；合成记录与图件仍使用局部时间轴。
 
-2. **确定整体时间平移量。** 按配置的上下限扫描时间平移，步长等于子波的时间采样间隔。将平移后的反射系数与固定子波卷积，拟合振幅尺度并计算波形相关性，选择相关性最高的候选。配置为零时移的井在零点完成合成与评价，采用零平移量。
+### 核心输出
 
-3. **将时间平移换算为深度平移。** 使用每口井的局部时深关系，把原时间及平移后的时间分别映射回深度，两者之差形成随深度变化的平移曲线。平移曲线覆盖范围外使用端点值延伸，并记录受影响样点数量。
+第四步输出目录和通用文件见主指南。深度域还应检查：
 
-4. **导出两套深度平移曲线。** 全曲线版重新读取第三步的原始预处理文件，按连续有效段进行深度搬移，保留原有缺口，并由声波时差和密度重新计算声阻抗。滤波版保存合成计算所用的声波时差、密度和声阻抗，按同一平移曲线导出。第六步井控集读取滤波版，合成基准分别使用两套曲线。
-
-5. **汇总合成结果。** 输出每井波形对比、扫描曲线和深度平移统计。汇总图使用各井实际采用的平移量，另报告来源井的批量平移与第四步标定平移之间的差值。
-
-零时移名单需使用本次测井目录中的井名，来源井保留正常扫描；重复井名或未知井名会导致配置失败。所有成功导出的井都进入下游井控处理。
-
-### 核心输出文件
-
-| 文件 | 内容 |
-|------|------|
-| `wavelet_batch_metrics.csv` | 全井汇总：时移策略、扫描最佳时移、实际采用时移、corr、NMAE、深度平移统计、产物路径 |
-| `run_summary.json` | 输入路径、LAS 契约说明、成功/失败计数 |
-| `shifted_preprocessed_las/<well>.las` | 深度平移后的 Step 3 全曲线 LAS |
-| `shifted_filtered_las/<well>.las` | 深度平移后的 filtered DT_USM/RHO_GCC/AI |
-| `shift_scans/shift_scan_<well>.csv` | 执行扫描井的时移扫描明细（shift_s, corr, nmae, scale） |
-| `depth_shift_curves/depth_shift_curve_<well>.csv` | 每井深度平移曲线（twt_s, tvdss_m, depth_shift_m） |
-| `synthetic_qc/synthetic_qc_<well>.csv` | 每井实际采用时移下的合成记录 QC |
-| `figures/qc_01_batch_metric_summary.png` | 批量指标汇总（corr, NMAE, applied shift） |
-| `figures/qc_02_batch_depth_shift_summary.png` | 深度平移汇总（median + P10-P90） |
-| `figures/qc_<well>_synthetic_vs_seismic.png` | 每井 R1 风格六 panel 波形 QC 图 |
-| `figures/qc_<well>_shift_scan.png` | 执行扫描井的时移扫描 corr 曲线 |
-
----
-
-## 旁路：深度域第六步正演输入冻结
-
-这一步将岩石物理分析的声阻抗—纵波速度关系与第四步的固定子波组装为统一正演输入，供第六步井控质检和深度域合成基准读取。
-
-岩石物理分析和子波提取各自独立重跑，本旁路只在子波或关系发生变化时才需要重跑，避免更新子波时必须重跑整个岩石物理拟合。
-
-### 快速开始
-
-```powershell
-python scripts/depth_forward_model_inputs.py
-python scripts/depth_forward_model_inputs.py --config experiments/common/common.yaml
-python scripts/depth_forward_model_inputs.py --config "<config-yaml>" --output-dir "<forward-input-output-dir>"
-```
-
-不带参数时，脚本自动发现最新的岩石物理分析和深度域第 4 步产物。
-
-### 配置参考
-
-所有配置在 `depth_forward_model_inputs` 段下：
-
-```yaml
-depth_forward_model_inputs:
-  source_runs:
-    rock_physics_analysis_dir: "<rock-physics-run-dir>"
-    vertical_well_auto_tie_depth_dir: "<tie-run-dir>"
-  source_well_name: "<source-well>"       # 与第四步保持一致
-```
-
-同时需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
-
-### 脚本在做什么
-
-1. 读取成功的岩石物理拟合与单井标定结果，核对深度口径和子波来源井。
-2. 读取子波的时间与振幅，检查规则采样、奇数样点数和零时刻居中，通过卷积计算检查正演输入条件。
-3. 读取声阻抗与纵波速度的线性关系，检查公式、系数、物理单位和参与拟合的井清单。
-4. 汇总子波路径、采样参数、关系系数及来源记录，写出统一正演输入文件，供各下游步骤共用。
-
-### 核心输出文件
-
-| 文件 | 内容 |
-|------|------|
-| `forward_model_inputs.json` | 固定正演输入：子波路径与参数、AI–Vp 关系路径与系数、来源运行 |
-| `run_summary.json` | 来源运行发现方式、子波来源井和产物路径 |
-
----
-
-## 第 6 步：深度域井控集与正演质检
-
-第六步读取批量深度平移后的滤波测井，将井曲线与位置对齐到地震深度轴，同时保留滤波曲线的原生采样版本。入口与主教程相同：
-
-```powershell
-python scripts/real_field_well_controls.py --config "<config-yaml>" --output-dir "<well-control-output-dir>"
-```
-
-### 配置参考
-
-以下配置与前面的工区配置放在同一个文件中。来源运行目录和井资产清单相对仓库根目录解析，轨迹目录相对数据根目录解析。
-
-```yaml
-assets:
-  well_trace_dir: "<well-trajectory-dir>"
-
-real_field_well_controls:
-  source_run_type: wavelet_batch_synthetic_depth
-  source_run_dir: "<batch-run-dir>"
-  well_inventory_file: "<well-inventory-csv>"
-  qc:
-    forward_model_inputs_run_dir: "<forward-input-run-dir>"
-    body_smoothing_fwhm_m: 25.0
-    dynamic_correlation_window_m: 75.0
-    event_threshold_fraction: 0.1
-    max_event_windows_per_well: 4
-```
-
-质检子段提供固定正演输入、主体平滑尺度、局部相关窗口和事件窗口筛选参数；第八步的速度来源按后文单独配置。
-
-源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。`body_smoothing_fwhm_m` 表示高斯核的半高全宽，`dynamic_correlation_window_m` 表示局部相关窗口长度，二者均按米填写并取正值。`event_threshold_fraction` 大于 0 且不超过 1，`max_event_windows_per_well` 为正整数。
-
-### 脚本在做什么
-
-1. **读取成功井的滤波曲线。** 根据第五步汇总表选择成功井，读取平移后的滤波声阻抗，并保留原生测井轴上的曲线与有效性信息。
-2. **转换井深与位置。** 直井采用补心高程换算垂深并使用井口位置；斜井沿轨迹将测深转换为海平面以下垂深和平面位置。
-3. **对齐到地震深度轴。** 在连续有效曲线段内插值到地震的规则深度样点，保存每个样点的井位置和有效性，写出逐井数据与汇总清单。
-4. **构造主体平滑曲线。** 在每口井的连续有效段内，对对数阻抗做按深度距离定义的高斯平滑，形成用于主体波形质检的临时曲线；井控文件保留上游已标定滤波曲线。
-5. **执行正演与波形比较。** 使用正演输入中的参考子波和阻抗—速度关系分别对滤波曲线与主体平滑曲线正演，在同一评价区间使用同一振幅增益比较整体波形，并按动态窗口计算局部相关性。
-6. **筛选事件窗口并写出固定评价支撑。** 按事件振幅阈值和每井窗口数量上限整理局部比较结果；评价支撑由滤波曲线的基础正演确定，主体平滑曲线需要完整覆盖同一区间。
-
-### 质检输出
-
-| 文件 | 内容 |
+| 产物 | 用途 |
 |---|---|
-| `qc/figures/<well>/full_waveform_qc.png` | 已标定滤波阻抗的基础正演对比 |
-| `qc/figures/<well>/body_waveform_qc.png` | 滤波曲线与主体平滑曲线在同一评价区间、同一振幅增益下的正演对比 |
-| `qc/figures/<well>/event_waveform_comparison.png` | 事件窗口中的局部波形比较 |
-| `qc/metrics.csv` | 每井固定评价支撑、共享增益、两套正演相关系数、相关性变化、误差、振幅比例和事件窗口统计 |
-| `qc/evaluation_support.json` | 每井固定评价支撑的轴区间和样点索引 |
-| `qc/manifest.json` | 质检参数、来源和图件路径 |
+| `wavelet_inventory.csv` | 记录每口成功可信井的候选子波及来源指标 |
+| `time_depth/` | 保存标定前后的局部时深关系 |
+| `depth_mapping/source_depth_mapping_<well>.csv` | 保存原始深度到双程旅行时的固定观测映射 |
+| `depth_mapping/aligned_depth_<well>.csv` | 保存优化时深关系回写后的深度位置 |
+| `seismic_trace/depth_seismic_trace_<well>.csv` | 保存原始深度地震道 |
+| `filtered_las/` | 保存回写到观测深度的标定滤波曲线，并保留原始缺口 |
+| `synthetic_qc/`、`figures/` | 保存局部时间轴上的合成记录、匹配和子波图 |
+| `run_summary.json` | 记录采样域、井角色、来源和每井产物路径 |
 
-井控清单和逐井数组的通用结构见[第六步主教程](6-real-field-well-controls.md)。深度域中，`samples` 表示地震的海平面以下垂深样点，`native_coordinates` 表示原生测井样点转换后的海平面以下垂深，两者单位均为米。模型轴曲线和原生曲线都来自第五步每口井的已标定滤波测井；第六步同时写出固定评价支撑，供后续反演和质检读取。
+深度映射只覆盖固定初始时深关系 `T0` 支持内的连续有效 MD/TVDSS 段；支持范围外保持无效，不做端点外推。
 
-## 第 7 步：深度域低频模型
+第四步检查时，先确认局部时深关系单调且覆盖目标层段，再结合 `aligned_depth`、`source_depth_mapping` 和原生深度地震道检查回写位置。原生深度网格上的候选评分和批量波形 QC 由第五步完成。
 
-第七步使用深度域井控集和解释层位，按实际平面坐标构建低频模型。基线方法、修饰器和变体组织见[第七步主教程](7-real-field-lfm.md)；本节说明深度轴和滤波单位。
+---
+
+## 第 5 步：全局共识子波生成
+
+### 快速开始
 
 ```powershell
-python scripts/real_field_lfm.py --config "<config-yaml>" --output-dir "<lfm-output-dir>"
+python scripts/wavelet_generation.py --config <config-yaml>
+python scripts/wavelet_generation.py --config <config-yaml> --well <well-name>
+python scripts/wavelet_generation.py --config <config-yaml> --output-dir <wavelet-output-dir>
 ```
 
+第五步从第四步成功可信井读取候选子波，在规则时间轴上卷积正演，再通过固定的观测时深关系将合成记录采样回原始深度地震网格。在这个深度网格上交叉评测候选并搜索共识子波；子波本身保持时间采样轴。
+
 ### 配置参考
+
+```yaml
+wavelet_generation:
+  source_runs:
+    well_auto_tie_dir: <well-auto-tie-run-dir>
+  candidate_filter:
+    min_source_tie_corr: <minimum-correlation>
+    exclude_source_wells: []
+    include_source_wells: null
+  evaluation_wells:
+    exclude_wells: []
+    include_wells: null
+```
+
+顶层 `well_usage` 先决定井是否有资格进入第五步；候选过滤和评测过滤只在可信井集合内部生效。背景井不提供候选子波，也不参加共识评分。
+
+### 脚本在做什么
+
+1. **加载候选。** 读取第四步路由、标定指标、候选子波和每井域转换产物，检查子波中心、长度、采样间隔与能量。
+2. **准备正演轴。** 将第四步滤波曲线依据优化时深关系转换到规则时间轴，计算反射系数，并固定每口井的原始观测深度到时间映射。
+3. **交叉评测候选。** 用每条候选子波生成所有评测井的合成记录，将合成记录和观测地震共同采样回原始深度网格，再在该网格上计算相关系数和归一化误差，并按空间簇聚合井间指标。
+4. **搜索共识子波。** 在候选子波的主要形态空间中进行受约束搜索，综合整体匹配、差井表现、振幅误差和波形形态选择全局结果。
+5. **写出批量结果。** 保存选定子波、逐井合成记录和汇总指标。深度域根据第四步的固定观测深度映射把批量 QC 回到原始深度地震网格；井控曲线继续使用第四步的回写产物。
+
+### 核心输出
+
+| 产物 | 用途 |
+|---|---|
+| `selected_wavelet.csv` | 第六步正演质检和后续步骤读取的共识子波 |
+| `selected_wavelet_summary.json` | 记录共识选择、候选评测、采样定义和来源运行 |
+| `batch_synthetic_metrics.csv` | 每口评测井的合成记录指标 |
+| `synthetic_qc/`、`figures/` | 逐井波形、残差和子波质量控制 |
+| `run_summary.json` | 记录采样域、井角色、评测井和产物路径 |
+
+深度域正演输入使用第五步的 `selected_wavelet.csv`。正演输入旁路见本页末尾。
+
+---
+
+## 第 6 步：真实工区井控数据集
+
+第六步的入口和主体配置见[真实工区井控数据集](6-real-field-well-controls.md)。深度域配置集中使用三类来源：
+
+```yaml
+real_field_well_controls:
+  source_runs:
+    well_auto_tie_dir: <well-auto-tie-run-dir>   # 留空自动发现
+    well_preprocess_dir: <well-preprocess-run-dir> # 留空时从第四步摘要解析
+    well_inventory_dir: <well-inventory-run-dir>  # 留空时从第四步摘要解析
+  qc:
+    forward_model_inputs_run_dir: <forward-input-run-dir> # 留空自动发现
+    body_smoothing_fwhm_m: <smoothing-fwhm-m>
+    dynamic_correlation_window_m: <correlation-window-m>
+```
+
+`forward_model_inputs_run_dir` 留空时自动发现与当前深度域匹配的正演输入；主体平滑和动态相关窗口均按米填写。
+
+可信井从第四步读取已标定和回写后的曲线，第五步选定的共识子波和旁路正演输入用于正演质检；背景井从第三步读取曲线。两类井都可以写入井控清单并进入第七步，只有可信井进入第八步井监督。
+
+### 脚本在做什么
+
+1. **读取角色化井控来源。** 检查采样域、来源运行和井资产清单，分别加载可信井与背景井。
+2. **对齐深度轴。** 将曲线和井位转换到当前地震的深度基准，在连续有效段内插值到地震深度样点。
+3. **保存观测支撑。** 记录原生曲线、模型轴曲线和有效性掩码；缺口两侧不跨段插值。
+4. **执行正演质检。** 使用第五步选定子波和深度域正演关系比较井曲线正演结果，输出固定评价支撑和质检结果。
+
+---
+
+## 第 7 步：真实工区低频模型
+
+第七步的通用配置见[真实工区低频模型](7-real-field-lfm.md)。深度域配置要点如下：
 
 ```yaml
 real_field_lfm:
   source_runs:
-    well_control_run_dir: "<well-control-run-dir>"
-  output_geometry:
-    mode: volume
+    well_control_run_dir: <well-control-run-dir> # 留空自动发现
   baselines:
     depth_trend:
       method: trend
       filter:
         enabled: true
-        cutoff_wavelength_m: "<cutoff-wavelength-m>"
-        order: 6
-        buffer_mode: reflect
-        buffer_axis_units: "<depth-buffer-m>"
-      fit:
-        min_valid_samples_per_well: 32
-        huber_f_scale_log_ai: 0.05
-      spatial:
-        variogram: spherical
-        exact: true
-        nugget: 0.0
-  modifiers: {}
-  variants:
-    - variant_id: depth_trend_baseline
-      baseline_id: depth_trend
-      modifier_ids: []
-  comparisons: []
+        cutoff_wavelength_m: <cutoff-wavelength-m>
+        buffer_axis_units: <depth-buffer-m>
 ```
 
-截止波长和缓冲长度均按米填写，占位符需要替换为正数。井控集、地震和解释层位需要采用相同的海平面以下垂深口径，目标层位文件来自顶层工区配置。
+截止波长、缓冲长度和输出样点均按米解释。可信井和背景井都作为低频控制，空间插值使用真实平面米制坐标；井角色不会改变第七步的低频拟合资格。
 
 ### 脚本在做什么
 
-1. **建立共同网格。** 读取深度域井控、地震采样轴和目标层位，确定输出体、窗口或剖面的平面与深度范围。
-2. **提取井内低频信息。** 把截止波长换算为每米的空间频率，对每口井的连续有效阻抗段做双向低通，边界缓冲长度按深度采样间隔换算为样点数。
-3. **建立基线。** 趋势方法按层段相对深度拟合每井趋势参数，再沿平面插值；比例切片方法在层段相对深度上建立切片，逐片插值并还原到地震深度轴。
-4. **形成变体与输出。** 按配置叠加框架修饰和比较项，保存低频模型、有效性信息、拟合质检与图件。模型的深度轴以米表达，平面插值距离也以米表达。
+1. **建立共同网格。** 读取深度域地震、层位和井控，确定输出体的平面与深度轴。
+2. **提取井内低频信息。** 在每口井的连续有效段内按深度距离执行低通，保持缺口边界独立。
+3. **拟合空间基线。** 按相对层位位置拟合纵向趋势或比例切片，并在真实平面坐标上插值。
+4. **写出变体。** 保存低频模型、有效性信息、拟合质检和变体比较。
 
 ---
 
-## 第 8 步：深度域物理约束神经网络反演
+## 第 8 步：物理约束神经网络反演
 
-第八步读取深度域地震、井控和低频模型，在每条道上联合学习对数阻抗修正与卷积核。预测阻抗由低频模型与网络修正直接相加，第六步固定评价支撑用于井目标和波形质检。网络方法、联合损失和产物说明见[第八步主教程](8-ginn.md)。
-
-```powershell
-python scripts/piai_train.py --config "<inversion-config-yaml>" --output-dir "<training-output-dir>"
-```
-
-训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir`、`--velocity-volume`、`--trusted-well-name`、`--updates` 和 `--device` 覆盖对应配置。
-
-在第八步配置中，将上游输入指向本次深度域成果：
+第八步的通用配置见[物理约束神经网络反演](8-ginn.md)。深度域训练配置至少包含：
 
 ```yaml
 ginn_v3_body_inversion:
-  kernel:
-    dt_s: 0.002
-    duration_s: 0.2
   inputs:
-    lfm_run_dir: "<lfm-run-dir>"
-    variant_id: "<lfm-variant-id>"
-    well_control_run_dir: "<well-control-run-dir>"
+    lfm_run_dir: <lfm-run-dir> # 留空自动发现
+    variant_id: <lfm-variant-id>
+    well_control_run_dir: <well-control-run-dir> # 留空自动发现
     ai_velocity_relation:
-      formula: AI = a * Vp + b
-      a: <ai-vp-slope>
-      b: <ai-vp-intercept>
+      formula: "AI = a * Vp + b"
+      a: <ai-vp-coefficient-a>
+      b: <ai-vp-intercept-b>
       ai_unit: m/s*g/cm3
       vp_unit: m/s
       a_unit: g/cm3
       b_unit: m/s*g/cm3
-  trusted_well_names:
-    - "<trusted-well-a>"
-    - "<trusted-well-b>"
-  network:
-    tcn_channels: [16, 16, 16]
-    hidden_channels: 32
-    kernel_size: 3
-    dilation: 2
-    gru_layers: 3
-    dropout: 0.0
-  training:
-    updates: 1000
-    labeled_batch_size: 6
-    unlabeled_batch_size: 32
-    learning_rate: 0.004
-    weight_decay: 0.01
-    validation_gap_m: <validation-gap-m>
-    min_support_samples: 8
-    loss_weights:
-      independent: 1.0
-      physics: 1.0
-      cross: 1.0
+  kernel:
+    dt_s: <kernel-sampling-interval-s>
+    duration_s: <kernel-duration-s>
 ```
 
-训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。深度域速度来源在 `inputs.velocity_volume` 与 `inputs.ai_velocity_relation` 中二选一：速度体需要与低频模型同形状，并在低频模型有效支撑内保持有限且为正；关系映射使用完整的规范字段，由低频模型的线性声阻抗计算速度。训练与推理使用固定速度，把反射位置映射到双程旅行时后进行正演。
+深度域输入必须在 `velocity_volume` 和 `ai_velocity_relation` 之间选择一个。上例使用单位明确的 AI–Vp 关系；如果使用速度体，则将其路径填入 `inputs.velocity_volume`，并删除 `ai_velocity_relation`。
 
-地震、低频模型和井控的纵向采样轴以米表示，卷积核的相对时间轴以秒表示。正演在相邻阻抗样点的中点界面上放置反射事件，按双程旅行时计算界面时间，并在秒单位上对学习卷积核做线性插值。卷积核时间间隔由本步显式配置，独立于深度体的米制采样间隔。
+全局可信井名单来自顶层 `well_usage`。如需只使用其中一部分训练，可在第八步段落中提供训练子集；背景井始终只提供第七步低频背景，不参与第八步井监督。
 
-| 配置 | 深度域语义 |
-|------|------------|
-| `kernel.dt_s` | 学习卷积核的时间采样间隔，单位为秒 |
-| `kernel.duration_s` / `kernel.samples` | 学习卷积核窗口；总时长和奇数样点数二选一 |
-| `inputs.velocity_volume` | 完整速度体路径，与低频模型同形状 |
-| `inputs.ai_velocity_relation` | 内联 AI–Vp 关系，包含 `formula`、`a`、`b`、`ai_unit`、`vp_unit`、`a_unit` 和 `b_unit` |
-| `validation_gap_m` | 平面空间验证块与训练区之间的米制间隔 |
-| `min_support_samples` | 参与训练和评价的最少有效样点数 |
+### 脚本在做什么
 
-井控、低频模型和地震的深度轴、线网及空间几何需要一致，平面验证间隔以米表示。训练使用井阻抗监督、预测正演与批间卷积核交换三项联合损失。训练完成后生成检查点、平均学习卷积核、井曲线和数值质检结果；体预测由独立入口执行。第四、第五步的固定子波仍属于深度域井震标定和批量合成链路，第八步的学习卷积核由本段 `kernel` 配置独立确定。
+1. **准备深度域样本。** 读取地震、井控和低频模型，在共同深度轴上建立训练与验证道。
+2. **建立正演关系。** 由速度体或 AI–Vp 关系得到正演速度，把相邻阻抗样点中点的界面位置转换为双程旅行时。
+3. **预测阻抗与学习核。** 网络输出阻抗修正和以秒为单位的学习卷积核，修正直接叠加到低频模型。
+4. **联合更新。** 使用可信井监督、预测正演和批间卷积核交换三项约束更新网络。
+5. **评价和输出。** 保存检查点、学习卷积核、井旁 QC；体预测由独立入口按需执行。
 
 ---
 
-## 与时间域工作流的关系
+## 深度域正演输入旁路
 
-前三步为两种域共享的井数据准备。时间域第四、第五步依次完成全井标定和共识子波生成；深度域第四、第五步依次完成固定子波提取和批量深度平移。两条路径的滤波测井成果分别进入第六步井控集，再用于第七步真实工区低频模型和第八步物理约束神经网络反演。
+当第六步需要使用固定 AI–Vp 关系和共识子波进行井控质检时，运行正演输入旁路：
 
-岩石物理分析从第三步测井出发，与深度域第四步的固定子波共同组成第六步质检和合成基准使用的正演输入。第八步沿用深度域的井控与低频模型，并在本段配置速度来源和学习卷积核。
+```powershell
+python scripts/depth_forward_model_inputs.py --config <config-yaml>
+python scripts/depth_forward_model_inputs.py --config <config-yaml> --output-dir <forward-input-output-dir>
+```
+
+配置使用第五步的选定子波：
+
+```yaml
+depth_forward_model_inputs:
+  source_runs:
+    rock_physics_analysis_dir: <rock-physics-run-dir>
+    wavelet_generation_dir: <wavelet-generation-run-dir>
+```
+
+### 脚本在做什么
+
+1. 读取岩石物理分析产出的 AI–Vp 关系和第五步选定子波。
+2. 检查子波采样、零时刻和能量归一化，以及关系式和单位。
+3. 汇总来源运行、关系系数和选定子波路径，写出固定正演输入。
+
+这条旁路只组装正演输入，不改变第四步和第五步的井震标定结果。
+
+---
+
+## 深度域结果检查顺序
+
+1. 先检查第四步每口可信井的局部时深关系是否单调、覆盖目标层段，并查看局部时间轴 QC 与深度映射产物。
+2. 再检查第五步候选子波、共识选择和逐井批量合成结果，确认共识子波没有由单口井主导。
+3. 检查第六步的可信井、背景井角色和有效性掩码，确认背景井只进入低频建模。
+4. 最后查看第七步低频模型与第八步井旁监督结果，确保所有深度轴和空间几何来自同一地震体。

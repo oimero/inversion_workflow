@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import warnings
 
 import numpy as np
@@ -13,17 +13,14 @@ import pandas as pd
 
 from cup.utils.coerce import as_bool as _as_bool
 from cup.utils.coerce import optional_float as _optional_float
-from cup.utils.io import sanitize_filename
 from cup.utils.masks import true_runs
 from cup.utils.statistics import radius_connected_components
 from cup.well.inventory import normalize_well_name
-from cup.well.las import StandardVpRhoLogs, load_vp_rho_logset_from_standard_las
+from cup.well.las import StandardVpRhoLogs, load_standard_vp_rho_logs
 from cup.well.trajectory import crop_logset_md, load_workflow_time_depth_table_csv
 from wtie.processing import grid
 
-WELL_AUTO_TIE_SCHEMA_VERSION = "well_auto_tie_v3"
-DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION = "vertical_well_auto_tie_depth_v2"
-DEPTH_WAVELET_BATCH_SCHEMA_VERSION = "wavelet_batch_synthetic_depth_v4"
+WELL_AUTO_TIE_SCHEMA_VERSION = "well_auto_tie_v4"
 
 @dataclass(frozen=True)
 class ContinuousTieLogResult:
@@ -92,6 +89,10 @@ def fill_short_joint_gaps(
             "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=True),
         }
     )
+    # These masks describe the temporary forward-evaluation logset.  The
+    # exported Step-4 LAS is still written from the original observations.
+    logs.observed_mask = np.asarray(standard.observed_mask, dtype=bool).copy()
+    logs.filled_gap_mask = filled.copy()
     return logs, filled
 
 
@@ -179,6 +180,8 @@ def prepare_continuous_tie_logs(
             ),
         }
     )
+    cropped.observed_mask = original_joint[start:stop].copy()
+    cropped.filled_gap_mask = filled[start:stop].copy()
     qc: dict[str, float | int | bool] = {
         "joint_observed_fraction": (
             float(observed_window_count / original_window_count)
@@ -211,6 +214,8 @@ class TieRoute(str, Enum):
     VERTICAL_ANCHOR_FROM_TOPS = "vertical_anchor_from_tops"
     DEVIATED_WITH_TDT = "deviated_with_tdt"
     DEVIATED_ANCHOR_FROM_TOPS = "deviated_anchor_from_tops"
+    VERTICAL_LOCAL_DEPTH = "vertical_local_depth"
+    DEVIATED_LOCAL_DEPTH = "deviated_local_depth"
     REJECTED = "rejected"
 
 
@@ -233,6 +238,7 @@ class WellTiePlan:
     surface_y: float | None
     kb_m: float | None
     reasons: str = ""
+    well_role: str = "trusted"
 
     def to_row(self) -> dict[str, Any]:
         return asdict(self)
@@ -281,16 +287,26 @@ class TieEvaluationWell:
     input_las: Path
     optimized_tdt_file: Path
     seismic_trace_file: Path
+    max_short_log_gap_s: float
     surface_x: float | None = None
     surface_y: float | None = None
     tie_window_start_s: float | None = None
     tie_window_end_s: float | None = None
+    sample_domain: str = "time"
+    aligned_depth_file: Path | None = None
+    source_depth_mapping_file: Path | None = None
+    depth_seismic_trace_file: Path | None = None
+    target_top_tvdss_m: float | None = None
+    target_bottom_tvdss_m: float | None = None
 
     def to_row(self) -> dict[str, Any]:
         row = asdict(self)
         row["input_las"] = self.input_las.as_posix()
         row["optimized_tdt_file"] = self.optimized_tdt_file.as_posix()
         row["seismic_trace_file"] = self.seismic_trace_file.as_posix()
+        for key in ("aligned_depth_file", "source_depth_mapping_file", "depth_seismic_trace_file"):
+            value = getattr(self, key)
+            row[key] = None if value is None else value.as_posix()
         return row
 
 
@@ -367,20 +383,9 @@ def _resolve_artifact_path(value: Any, index: TieArtifactIndex) -> Path | None:
     path = Path(text)
     if path.is_absolute():
         return path
-    candidates: list[Path] = []
     if index.repo_root is not None:
-        candidates.append(index.repo_root / path)
-    candidates.extend([Path.cwd() / path, index.auto_tie_dir / path])
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0] if candidates else path
-
-
-def _prefer_existing_or_fallback(path: Path | None, fallback: Path) -> Path:
-    if path is not None and path.exists():
-        return path
-    return fallback
+        return index.repo_root / path
+    return index.auto_tie_dir / path
 
 
 def _build_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -417,8 +422,30 @@ def build_tie_plan(
     trace_lookup: Mapping[str, Path],
     enabled_routes: Sequence[str],
     allow_near_outside: bool = False,
+    sample_domain: str = "time",
+    well_roles: Mapping[str, str] | Callable[[str], str] | None = None,
 ) -> list[WellTiePlan]:
-    """为清单中的每口井构建一行标定路由计划。"""
+    """为清单中的每口井构建一行标定路由计划。
+
+    ``sample_domain`` only changes the asset needed to select a route.  Time
+    domain routes use an existing TDT, while depth-domain routes derive their
+    local TWT table from the well Vp during execution.  The planner still
+    records one row for every inventory well so role-based exclusions remain
+    visible in the plan.
+    """
+    domain = str(sample_domain).strip().casefold()
+    if domain not in {"time", "depth"}:
+        raise ValueError("sample_domain must be 'time' or 'depth'.")
+
+    def role_for(name: str) -> str:
+        if well_roles is None:
+            return "trusted"
+        value = well_roles(name) if callable(well_roles) else well_roles.get(name)
+        role = "trusted" if value is None else str(value).strip().casefold()
+        if role not in {"trusted", "background_only", "excluded"}:
+            raise ValueError(f"Unsupported well role for {name!r}: {value!r}.")
+        return role
+
     preprocess_by_key = _build_lookup(preprocess_df)
     trajectory_by_key = _build_lookup(trajectory_df if trajectory_df is not None else pd.DataFrame())
     enabled = {str(route) for route in enabled_routes}
@@ -464,12 +491,18 @@ def build_tie_plan(
         if not input_las:
             reasons.append("no_preprocessed_las")
 
+        well_role = role_for(well_name)
         route = TieRoute.REJECTED.value
         route_status = "rejected"
         route_reasons = list(reasons)
 
         base_assets_ok = in_allowed_survey and usable_p and usable_rho and bool(input_las)
-        if base_assets_ok and wellbore_qc == "vertical" and has_time_depth:
+        if domain == "depth":
+            if base_assets_ok and wellbore_qc == "vertical":
+                route = TieRoute.VERTICAL_LOCAL_DEPTH.value
+            elif base_assets_ok and wellbore_qc == "deviated" and has_well_trace:
+                route = TieRoute.DEVIATED_LOCAL_DEPTH.value
+        elif base_assets_ok and wellbore_qc == "vertical" and has_time_depth:
             route = TieRoute.VERTICAL_WITH_TDT.value
         elif base_assets_ok and wellbore_qc == "vertical" and (not has_time_depth) and has_well_tops:
             route = TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value
@@ -480,15 +513,21 @@ def build_tie_plan(
         else:
             if wellbore_qc not in {"vertical", "deviated"}:
                 route_reasons.append(f"wellbore_class_{wellbore_qc or 'unknown'}")
-            if not has_time_depth:
+            if domain == "time" and not has_time_depth:
                 route_reasons.append("no_time_depth")
-            if wellbore_qc == "deviated" and not has_well_trace:
+            if domain == "depth" and wellbore_qc == "deviated" and not has_well_trace:
                 route_reasons.append("no_well_trace")
-            if not has_well_tops:
+            if domain == "time" and not has_well_tops:
                 route_reasons.append("no_well_tops")
 
+        if well_role != "trusted" and route == TieRoute.REJECTED.value:
+            route_reasons.append(f"well_role_{well_role}")
+
         if route != TieRoute.REJECTED.value:
-            if route in enabled:
+            if well_role != "trusted":
+                route_status = "skipped_role"
+                route_reasons = [f"well_role_{well_role}"]
+            elif route in enabled:
                 route_status = "planned"
                 route_reasons = []
             else:
@@ -514,6 +553,7 @@ def build_tie_plan(
                 surface_y=_optional_float(inv.get("surface_y")),
                 kb_m=_optional_float(inv.get("kb_m")),
                 reasons=";".join(dict.fromkeys(route_reasons)),
+                well_role=well_role,
             )
         )
 
@@ -537,14 +577,41 @@ def load_tie_artifacts(auto_tie_dir: str | Path, *, repo_root: str | Path | None
     plan_path = auto_tie_path / "well_tie_plan.csv"
     metrics_path = auto_tie_path / "well_tie_metrics.csv"
     wavelet_inventory_path = auto_tie_path / "wavelet_inventory.csv"
-    missing = [path for path in [plan_path, metrics_path, wavelet_inventory_path] if not path.exists()]
+    summary_path = auto_tie_path / "run_summary.json"
+    missing = [path for path in [plan_path, metrics_path, wavelet_inventory_path, summary_path] if not path.exists()]
     if missing:
         raise FileNotFoundError(f"auto-tie artifact directory is missing files: {[str(path) for path in missing]}")
+    import json
+
+    with summary_path.open("r", encoding="utf-8") as fp:
+        summary = json.load(fp)
+    if summary.get("schema_version") != WELL_AUTO_TIE_SCHEMA_VERSION:
+        raise ValueError(
+            f"auto-tie run_summary schema_version must be {WELL_AUTO_TIE_SCHEMA_VERSION!r}, "
+            f"got {summary.get('schema_version')!r}: {summary_path}"
+        )
+    sample_domain = str(summary.get("sample_domain") or "").strip().casefold()
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError(f"auto-tie run_summary has invalid sample_domain: {summary.get('sample_domain')!r}")
+    expected_unit = "s" if sample_domain == "time" else "m"
+    if str(summary.get("sample_unit") or "").strip().casefold() != expected_unit:
+        raise ValueError(f"auto-tie run_summary sample_unit must be {expected_unit!r} for {sample_domain}.")
+    if sample_domain == "depth" and summary.get("depth_basis") != "tvdss":
+        raise ValueError("Depth auto-tie run_summary must declare depth_basis='tvdss'.")
+    if sample_domain == "time" and summary.get("depth_basis") is not None:
+        raise ValueError("Time auto-tie run_summary must not declare depth_basis.")
+    plan_df = pd.read_csv(plan_path)
+    metrics_df = pd.read_csv(metrics_path)
+    inventory_df = pd.read_csv(wavelet_inventory_path)
+    if "sample_domain" in metrics_df.columns and not metrics_df.empty:
+        domains = {str(value).strip().casefold() for value in metrics_df["sample_domain"].dropna()}
+        if domains != {sample_domain}:
+            raise ValueError(f"well_tie_metrics.csv sample_domain values {sorted(domains)} do not match run_summary {sample_domain!r}.")
     return TieArtifactIndex(
         auto_tie_dir=auto_tie_path,
-        plan_df=pd.read_csv(plan_path),
-        metrics_df=pd.read_csv(metrics_path),
-        wavelet_inventory_df=pd.read_csv(wavelet_inventory_path),
+        plan_df=plan_df,
+        metrics_df=metrics_df,
+        wavelet_inventory_df=inventory_df,
         repo_root=root,
     )
 
@@ -563,7 +630,11 @@ def load_candidate_wavelets(
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"wavelet_inventory.csv is missing columns: {sorted(missing)}")
-    include_keys = {normalize_well_name(name) for name in include_source_wells} if include_source_wells else None
+    include_keys = (
+        {normalize_well_name(name) for name in include_source_wells}
+        if include_source_wells is not None
+        else None
+    )
     exclude_keys = {normalize_well_name(name) for name in exclude_source_wells} if exclude_source_wells else set()
     candidates: list[WaveletCandidate] = []
     for _, row in df.iterrows():
@@ -615,6 +686,18 @@ def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -
     metrics = index.metrics_df
     if metrics.empty or "well_name" not in metrics.columns:
         return []
+    required = {
+        "tie_status",
+        "route",
+        "sample_domain",
+        "max_short_log_gap_s",
+        "filtered_las_file",
+        "optimized_tdt_file",
+        "seismic_trace_file",
+    }
+    missing = sorted(required - set(metrics.columns))
+    if missing:
+        raise ValueError(f"well_tie_metrics.csv is missing columns: {missing}")
     wells: list[TieEvaluationWell] = []
     for _, row in metrics.iterrows():
         if _string_value(row.get("tie_status")) != status:
@@ -625,33 +708,56 @@ def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -
         key = normalize_well_name(well_name)
         plan = plan_by_key.get(key)
         input_las = _resolve_artifact_path(row.get("filtered_las_file"), index)
-        input_las = _prefer_existing_or_fallback(
-            input_las,
-            index.auto_tie_dir / "filtered_las" / f"filtered_logs_{sanitize_filename(well_name)}.las",
-        )
         optimized_tdt = _resolve_artifact_path(row.get("optimized_tdt_file"), index)
         seismic_trace = _resolve_artifact_path(row.get("seismic_trace_file"), index)
-        optimized_tdt = _prefer_existing_or_fallback(
-            optimized_tdt,
-            index.auto_tie_dir / "time_depth" / f"optimized_tdt_{sanitize_filename(well_name)}.csv",
-        )
-        seismic_trace = _prefer_existing_or_fallback(
-            seismic_trace,
-            index.auto_tie_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv",
-        )
-        if input_las is None or not input_las.exists() or not optimized_tdt.exists() or not seismic_trace.exists():
-            continue
+        paths = {
+            "filtered_las_file": input_las,
+            "optimized_tdt_file": optimized_tdt,
+            "seismic_trace_file": seismic_trace,
+        }
+        missing_paths = [name for name, path in paths.items() if path is None or not path.exists()]
+        if missing_paths:
+            raise FileNotFoundError(
+                f"Successful auto-tie well {well_name!r} is missing artifacts {missing_paths} in {index.auto_tie_dir}."
+            )
+        sample_domain = _string_value(row.get("sample_domain"))
+        if sample_domain not in {"time", "depth"}:
+            raise ValueError(f"Invalid sample_domain for {well_name!r}: {sample_domain!r}")
+        max_short_gap_s = _optional_float(row.get("max_short_log_gap_s"))
+        if max_short_gap_s is None or not np.isfinite(max_short_gap_s) or max_short_gap_s < 0.0:
+            raise ValueError(f"Successful auto-tie well {well_name!r} has invalid max_short_log_gap_s.")
+        aligned_depth = _resolve_artifact_path(row.get("aligned_depth_file"), index)
+        source_mapping = _resolve_artifact_path(row.get("source_depth_mapping_file"), index)
+        depth_seismic = _resolve_artifact_path(row.get("depth_seismic_trace_file"), index)
+        if sample_domain == "depth":
+            depth_paths = {
+                "aligned_depth_file": aligned_depth,
+                "source_depth_mapping_file": source_mapping,
+                "depth_seismic_trace_file": depth_seismic,
+            }
+            missing_depth = [name for name, path in depth_paths.items() if path is None or not path.exists()]
+            if missing_depth:
+                raise FileNotFoundError(
+                    f"Successful depth auto-tie well {well_name!r} is missing artifacts {missing_depth}."
+                )
         wells.append(
             TieEvaluationWell(
                 well_name=well_name,
                 route=_string_value(row.get("route")),
-                input_las=input_las,
-                optimized_tdt_file=optimized_tdt,
-                seismic_trace_file=seismic_trace,
+                input_las=input_las,  # type: ignore[arg-type]
+                optimized_tdt_file=optimized_tdt,  # type: ignore[arg-type]
+                seismic_trace_file=seismic_trace,  # type: ignore[arg-type]
                 surface_x=_optional_float(plan.get("surface_x")) if plan is not None else None,
                 surface_y=_optional_float(plan.get("surface_y")) if plan is not None else None,
                 tie_window_start_s=_optional_float(row.get("tie_window_start_s")),
                 tie_window_end_s=_optional_float(row.get("tie_window_end_s")),
+                sample_domain=sample_domain,
+                aligned_depth_file=aligned_depth,
+                source_depth_mapping_file=source_mapping,
+                depth_seismic_trace_file=depth_seismic,
+                target_top_tvdss_m=_optional_float(row.get("target_top_tvdss_m")),
+                target_bottom_tvdss_m=_optional_float(row.get("target_bottom_tvdss_m")),
+                max_short_log_gap_s=float(max_short_gap_s),
             )
         )
     return wells
@@ -692,7 +798,12 @@ def build_reflectivity_for_tie_eval(logset: Any, table: Any, dt_s: float) -> Any
     if not getattr(table, "is_md_domain", False):
         raise ValueError("tie evaluation expects an MD-domain TimeDepthTable.")
     logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, float(dt_s))
-    return tie_ops.compute_reflectivity(logset_twt)
+    reflectivity = tie_ops.compute_reflectivity(logset_twt)
+    if hasattr(logset, "observed_mask"):
+        reflectivity.source_observed_mask = np.asarray(logset.observed_mask, dtype=bool).copy()
+    if hasattr(logset, "filled_gap_mask"):
+        reflectivity.source_filled_gap_mask = np.asarray(logset.filled_gap_mask, dtype=bool).copy()
+    return reflectivity
 
 
 def load_saved_seismic_trace_csv(path: str | Path) -> Any:
@@ -784,9 +895,14 @@ def load_continuous_tie_evaluation_inputs(
     well_artifact: TieEvaluationWell,
 ) -> tuple[Any, Any, Any]:
     """Load and crop fourth-step artifacts to one gap-free evaluation window."""
-    logset = load_vp_rho_logset_from_standard_las(well_artifact.input_las)
+    standard = load_standard_vp_rho_logs(well_artifact.input_las)
     table = load_workflow_time_depth_table_csv(well_artifact.optimized_tdt_file)
     seismic = load_saved_seismic_trace_csv(well_artifact.seismic_trace_file)
+    evaluation_logs, filled_gap_mask = fill_short_joint_gaps(
+        standard,
+        table,
+        max_short_gap_s=float(well_artifact.max_short_log_gap_s),
+    )
 
     start_s = max(float(seismic.basis[0]), float(table.twt[0]))
     end_s = min(float(seismic.basis[-1]), float(table.twt[-1]))
@@ -808,7 +924,11 @@ def load_continuous_tie_evaluation_inputs(
     )
     md_start = float(np.interp(float(seismic.basis[0]), table.twt, table.md))
     md_end = float(np.interp(float(seismic.basis[-1]), table.twt, table.md))
-    logset = crop_logset_md(logset, md_start, md_end, min_samples=2)
+    logset = crop_logset_md(evaluation_logs, md_start, md_end, min_samples=2)
+    source_md = np.asarray(standard.logs.basis, dtype=np.float64)
+    cropped_mask = (source_md >= md_start) & (source_md <= md_end)
+    logset.observed_mask = np.asarray(standard.observed_mask, dtype=bool)[cropped_mask]
+    logset.filled_gap_mask = np.asarray(filled_gap_mask, dtype=bool)[cropped_mask]
     joint_valid = (
         np.isfinite(logset.Vp.values)
         & (logset.Vp.values > 0.0)
@@ -940,3 +1060,69 @@ def scaled_synthetic_metrics(
     corr = float(np.corrcoef(seismic_norm, synthetic)[0, 1]) if np.std(synthetic) > 0 else np.nan
     nmae = float(np.sum(np.abs(seismic_norm - synthetic)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
     return seismic_norm, synthetic, corr, nmae, scale
+
+
+# Evaluation on the fixed native depth seismic grid
+
+@dataclass(frozen=True)
+class DepthTieSampling:
+    """Native observed samples and their unchanged local-time coordinates."""
+
+    seismic: grid.Seismic
+    time_at_depth: grid.Log
+
+
+def prepare_depth_tie_sampling(well: TieEvaluationWell, time_axis: np.ndarray) -> DepthTieSampling:
+    """Read Step-4 native seismic and its original depth-to-time mapping once."""
+    mapping_path = well.source_depth_mapping_file
+    seismic_path = well.depth_seismic_trace_file
+    if mapping_path is None or seismic_path is None:
+        raise ValueError(f"{well.well_name}: depth evaluation requires the original seismic and its time mapping.")
+    mapping = pd.read_csv(mapping_path)
+    observed = pd.read_csv(seismic_path)
+    for frame, required, path in ((mapping, {"tvdss_m", "twt_s"}, mapping_path),
+                                  (observed, {"tvdss_m", "seismic"}, seismic_path)):
+        if not required.issubset(frame.columns):
+            raise ValueError(f"{path}: missing columns {sorted(required-set(frame.columns))}.")
+    table = grid.TimeDepthTable(twt=mapping.twt_s.to_numpy(), tvdss=mapping.tvdss_m.to_numpy())
+    native = grid.Seismic(observed.seismic.to_numpy(), observed.tvdss_m.to_numpy(), "tvdss")
+    time_axis = np.asarray(time_axis, dtype=np.float64)
+    query = np.interp(native.basis, table.tvdss, table.twt, left=np.nan, right=np.nan)
+    keep = np.isfinite(query) & (query >= time_axis[0]-1e-10) & (query <= time_axis[-1]+1e-10)
+    if np.count_nonzero(keep) < 3:
+        raise ValueError(f"{well.well_name}: too few native seismic depth samples cover the matched time interval.")
+    depth_axis = native.basis[keep]
+    values = native.values[keep]
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{well.well_name}: native depth seismic contains non-finite samples inside the evaluation interval.")
+    return DepthTieSampling(grid.Seismic(values, depth_axis, "tvdss", name=well.well_name),
+                            grid.Log(query[keep], depth_axis, "tvdss", name="Original local TWT", unit="s"))
+
+
+def map_time_qc_to_depth(qc: pd.DataFrame, sampling: DepthTieSampling) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """Resample the synthetic, while keeping the observed depth coordinate fixed."""
+    axis = qc.twt_s.to_numpy(dtype=np.float64)
+    query = np.asarray(sampling.time_at_depth.values)
+    if np.any(query < axis[0]-1e-10) or np.any(query > axis[-1]+1e-10):
+        raise ValueError("Time synthetic does not cover the fixed depth evaluation grid.")
+    values = np.asarray(sampling.seismic.values, dtype=np.float64)
+    std = float(values.std())
+    if not np.isfinite(std) or std <= 0:
+        raise ValueError("Native depth seismic has zero standard deviation.")
+    observed = (values-values.mean())/std
+    synthetic = np.interp(query, axis, qc.synthetic_scaled.to_numpy(dtype=np.float64))
+    energy = float(np.dot(synthetic, synthetic))
+    if not np.isfinite(energy) or energy <= 0:
+        raise ValueError("Native-depth synthetic has no finite positive energy.")
+    scale = float(np.dot(observed, synthetic)/energy)
+    synthetic *= scale
+    data = {"tvdss_m":sampling.seismic.basis,"twt_s":query,"seismic_norm":observed,
+            "synthetic_scaled":synthetic,"residual":observed-synthetic,
+            "reflectivity":np.interp(query, axis, qc.reflectivity.to_numpy(dtype=np.float64))}
+    if "ai" in qc:
+        data["ai"] = np.interp(query, axis, qc.ai.to_numpy(dtype=np.float64))
+    result = pd.DataFrame(data)
+    metrics = {"corr":float(np.corrcoef(observed, synthetic)[0,1]),
+               "nmae":float(np.abs(observed-synthetic).sum()/np.abs(observed).sum()),
+               "scale_multiplier":scale,"n_eval_samples":len(result)}
+    return result, metrics

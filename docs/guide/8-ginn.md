@@ -2,7 +2,7 @@
 
 `piai_train.py` 是工作流的第八步。它读取地震体、第六步井控和第七步低频模型，联合学习阻抗修正与卷积核，输出反演网络、训练指标和井旁质量检查结果。
 
-本文说明时间域工区。每条地震道和对应低频模型组成一组输入，预测的对数阻抗等于低频模型与网络修正之和。学习卷积核的采样方式和时间跨度由本步配置显式给出。
+本文按时间域工区说明第八步。每条地震道和对应低频模型组成一组输入，预测的对数阻抗等于低频模型与网络修正之和。学习卷积核的采样方式和时间跨度由本步配置显式给出。
 
 ---
 
@@ -48,7 +48,7 @@ python scripts/piai_infer.py --config "<inversion-config-yaml>" --checkpoint "<s
 
 井控、低频模型和地震体需要具有相同的时间采样轴，低频模型的线轴和形状需要与当前地震体一致。时间单位为秒，线号对应关系由工区几何提供。
 
-当前训练井采用直井和固定平面位置。可信井名单中的井需要存在于井控集中，且第六步固定评价区间完整落在可用井曲线、地震和初模的共同支撑内。井位在地震道之间时，使用四邻道双线性权重采样。
+当前训练井采用直井和固定平面位置。`well_usage.trusted_well_names` 中的可信井需要存在于井控集中，且第六步固定评价区间完整落在可用井曲线、地震和初模的共同支撑内；`background_only_well_names` 中的井只参与第七步低频模型，不建立第八步井监督。井位在地震道之间时，使用四邻道双线性权重采样。
 
 学习卷积核使用以零时刻为中心的规则时间轴。卷积核采样间隔可以不同于地震体的采样间隔；正演时按秒进行线性插值，并在相邻阻抗样点的中点界面上放置反射事件。
 
@@ -61,19 +61,26 @@ python scripts/piai_infer.py --config "<inversion-config-yaml>" --checkpoint "<s
 ```yaml
 workflow_config: "<workflow-config-yaml>"
 
+well_usage:
+  trusted_well_names:
+    - <trusted-well-a>
+    - <trusted-well-b>
+  background_only_well_names:
+    - <background-well-a>
+
 ginn_v3_body_inversion:
   kernel:
     dt_s: 0.002
     duration_s: 0.2
 
   inputs:
-    lfm_run_dir: "<lfm-run-dir>"
+    lfm_run_dir: "<lfm-run-dir>"        # 留空自动发现匹配的第七步运行
     variant_id: "<lfm-variant-id>"
-    well_control_run_dir: "<well-control-run-dir>"
+    well_control_run_dir: "<well-control-run-dir>" # 留空自动发现匹配的第六步运行
 
+  # 可选：只从全局可信井中取训练子集
   trusted_well_names:
-    - "<trusted-well-a>"
-    - "<trusted-well-b>"
+    - <training-subset-well>
 
   network:
     tcn_channels: [16, 16, 16]
@@ -114,16 +121,20 @@ kernel:
   samples: <odd-kernel-sample-count>
 ```
 
-### 上游目录与可信井
+### 上游目录与井监督
 
 | 参数 | 含义 |
 |------|------|
 | `lfm_run_dir` | 第七步低频模型运行目录 |
 | `variant_id` | 该运行中实际存在的变体名称 |
 | `well_control_run_dir` | 第六步井控运行目录 |
-| `trusted_well_names` | 参与井约束训练的井名，必须非空且唯一 |
+| `well_usage.trusted_well_names` | 默认参与井约束训练的井名 |
+| `well_usage.background_only_well_names` | 参与低频背景、但不进入井监督的井名 |
+| `ginn_v3_body_inversion.trusted_well_names` | 可选的训练子集；填写后覆盖全局可信井名单 |
 
-上游目录和变体需要显式填写，相对路径从仓库根目录解析。命令行的 `--lfm-run-dir`、`--variant-id` 和 `--well-control-run-dir` 可以覆盖对应配置。重复使用 `--trusted-well-name` 可以指定多口可信井。
+低频模型目录和井控目录留空时，脚本会自动发现与当前地震域匹配的最近成功运行；填写目录后固定使用该次产物。变体名称需要填写为该运行中存在的变体。相对路径从仓库根目录解析。命令行的 `--lfm-run-dir`、`--variant-id` 和 `--well-control-run-dir` 可以覆盖对应配置。重复使用 `--trusted-well-name` 可以指定训练子集；未指定时使用全局可信井名单。训练子集必须是全局可信井的子集。
+
+如果 `well_usage.trusted_well_names` 为 `null`，则所有未列入 `background_only_well_names` 的合格井都属于全局可信井。显式可信井名单用于固定本轮工作流的准入范围。
 
 ### 学习卷积核窗口
 
@@ -187,7 +198,7 @@ kernel:
 
 ### 第一阶段：准备数据与网络
 
-1. **建立共同采样空间。** 读取地震、低频模型和井控，按时间轴、线轴与井位几何建立单道样本。
+1. **建立共同采样空间。** 读取地震、低频模型和井控，按当前采样轴、线轴与井位几何建立单道样本。
 2. **准备井目标与验证道。** 将原生滤波井曲线按有效段重采样到共同时间轴，并读取第六步固定评价区间；按平面距离选取训练道和验证道。
 3. **确定尺度与卷积核轴。** 汇总训练数据的归一化量，按配置的时间间隔和窗口长度建立以零时刻为中心的学习卷积核时间轴。
 

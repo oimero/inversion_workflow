@@ -397,18 +397,6 @@ class DepthGenerationSession:
         calibration_contract_fingerprint = require_contract_fingerprint(
             calibration_summary, label=f"depth calibration {calibration_summary_path.parent}"
         )
-        for label, reference in (
-            (
-                "rock_physics_analysis",
-                calibration.input_contracts.get("rock_physics_analysis"),
-            ),
-            (
-                "depth_forward_model_inputs",
-                calibration.input_contracts.get("depth_forward_model_inputs"),
-            ),
-        ):
-            if not str(dict(reference or {}).get("contract_fingerprint_sha256") or ""):
-                raise ValueError(f"impedance calibration lacks {label} provenance.")
         input_contracts = {
             "calibration": {
                 "path": repo_relative_path(calibration_summary_path, root=repo_root),
@@ -416,11 +404,9 @@ class DepthGenerationSession:
             },
             "rock_physics_analysis": {
                 "path": repo_relative_path(sources["rock_physics_analysis_dir"] / "run_summary.json", root=repo_root),
-                "contract_fingerprint_sha256": str(forward_inputs["_rock_physics_contract_fingerprint_sha256"]),
             },
             "depth_forward_model_inputs": {
                 "path": repo_relative_path(sources["depth_forward_model_inputs_dir"] / "run_summary.json", root=repo_root),
-                "contract_fingerprint_sha256": str(forward_inputs["_contract_fingerprint_sha256"]),
             },
         }
         if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):

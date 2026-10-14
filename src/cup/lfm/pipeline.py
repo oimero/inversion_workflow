@@ -985,6 +985,8 @@ def run_lfm_pipeline(
             "input_contracts": input_contracts,
             "resolved_config": dict(config),
             "seismic": context.common_sources["seismic"],
+            "sample_axis": context.sample_axis.describe(),
+            "depth_basis": context.depth_basis,
             "horizons": horizon_sources,
             "output_geometry": context.output_geometry.describe(),
             "requested_variant_ids": list(results),

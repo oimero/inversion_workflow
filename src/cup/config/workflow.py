@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -197,6 +197,63 @@ class SpatialDebiasConfig:
 
 
 @dataclass(frozen=True)
+class WellUsageConfig:
+    """One well-role policy shared by tying, background building and supervision."""
+
+    trusted_well_names: tuple[str, ...] | None = None
+    background_only_well_names: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "WellUsageConfig":
+        config = {} if value is None else _mapping(value, path="well_usage")
+        unknown = set(config) - {"trusted_well_names", "background_only_well_names"}
+        if unknown:
+            raise ValueError(f"Unknown well_usage fields: {sorted(unknown)}.")
+
+        def names(key: str, *, allow_null: bool) -> tuple[str, ...] | None:
+            raw = config.get(key)
+            if raw is None:
+                return None if allow_null else ()
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError(f"well_usage.{key} must be a list{' or null' if allow_null else ''}.")
+            result = tuple(str(name).strip() for name in raw)
+            keys = [name.casefold() for name in result]
+            if any(not name or name in {"nan", "none", "null", "<na>"} for name in keys):
+                raise ValueError(f"well_usage.{key} must contain non-empty well names.")
+            if len(keys) != len(set(keys)):
+                raise ValueError(f"well_usage.{key} contains duplicate well names.")
+            return result
+
+        trusted = names("trusted_well_names", allow_null=True)
+        background = names("background_only_well_names", allow_null=False)
+        overlap = {name.casefold() for name in trusted or ()} & {name.casefold() for name in background or ()}
+        if overlap:
+            raise ValueError(f"Trusted and background-only well names overlap: {sorted(overlap)}.")
+        return cls(trusted_well_names=trusted, background_only_well_names=background or ())
+
+    def role_for(self, well_name: str) -> str:
+        key = str(well_name).strip().casefold()
+        if key in {name.casefold() for name in self.background_only_well_names}:
+            return "background_only"
+        if self.trusted_well_names is None or key in {name.casefold() for name in self.trusted_well_names}:
+            return "trusted"
+        return "excluded"
+
+    def validate_names(self, available_names: Any) -> None:
+        available = {str(name).strip().casefold() for name in available_names}
+        specified = (*self.trusted_well_names, *self.background_only_well_names) if self.trusted_well_names is not None else self.background_only_well_names
+        unknown = [name for name in specified if name.casefold() not in available]
+        if unknown:
+            raise ValueError(f"well_usage names are absent from the well inventory: {unknown}.")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "trusted_well_names": None if self.trusted_well_names is None else list(self.trusted_well_names),
+            "background_only_well_names": list(self.background_only_well_names),
+        }
+
+
+@dataclass(frozen=True)
 class WorkflowConfig:
     data_root: str
     output_root: str
@@ -204,6 +261,7 @@ class WorkflowConfig:
     seismic: SeismicConfig
     well_curves: WellCurveContract
     spatial_debias: SpatialDebiasConfig
+    well_usage: WellUsageConfig = field(default_factory=WellUsageConfig)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "WorkflowConfig":
@@ -215,4 +273,5 @@ class WorkflowConfig:
             seismic=SeismicConfig.from_mapping(config.get("seismic")),
             well_curves=WellCurveContract.from_mapping(config.get("well_curves")),
             spatial_debias=SpatialDebiasConfig.from_mapping(config.get("spatial_debias")),
+            well_usage=WellUsageConfig.from_mapping(config.get("well_usage")),
         )

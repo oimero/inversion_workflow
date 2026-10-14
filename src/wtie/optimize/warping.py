@@ -122,7 +122,7 @@ def apply_lags_to_table(
     # interp = interp1d(interp_table.twt, interp_table.tvdss,
     #              bounds_error=False, fill_value=interp_table.tvdss[-1], kind='linear')
 
-    interp = interp1d(ss_twt, table.tvdss, bounds_error=False, fill_value="extrapolate", kind="linear")  # type: ignore
+    interp = interp1d(ss_twt, table.depth, bounds_error=False, fill_value="extrapolate", kind="linear")  # type: ignore
     ss_tvdss = interp(table.twt)  # rose mary
 
     # remove decreasing values
@@ -136,7 +136,10 @@ def apply_lags_to_table(
         newer_twt = newer_twt[:-1]
         newer_tvdss = newer_tvdss[:-1]
 
-    ss_table = grid.TimeDepthTable(twt=newer_twt, tvdss=newer_tvdss)
+    if table.is_md_domain:
+        ss_table = grid.TimeDepthTable(twt=newer_twt, md=newer_tvdss)
+    else:
+        ss_table = grid.TimeDepthTable(twt=newer_twt, tvdss=newer_tvdss)
 
     if post_process is not None:
         raise NotImplementedError(

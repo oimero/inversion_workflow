@@ -1,6 +1,6 @@
 # 04 井震自动标定
 
-`well_auto_tie.py` 是时间域工作流的第四步。它把前三步的产出（井资产、曲线筛选、预处理 LAS）与时深表、井轨迹、地震体组合起来，对每口井做井震标定，输出优化后的时深关系、候选子波和合成记录 QC。
+`well_auto_tie.py` 是工作流的第四步。本文按时间域说明：它把第一步的井资产和第三步的预处理 LAS 与时深表、井轨迹和地震体组合起来，对准入井做井震标定，输出优化后的时深关系、候选子波和合成记录 QC。
 
 ---
 
@@ -13,7 +13,7 @@ python scripts/well_auto_tie.py --well <well-name>
 python scripts/well_auto_tie.py --output-dir scripts/output/<well-auto-tie-run>
 ```
 
-不带参数时，脚本自动发现最新的前三步产物，在 `scripts/output/well_auto_tie_<timestamp>/` 下写出结果。
+不带参数时，脚本自动发现所需的第一步、第三步和可选轨迹 QC 产物，在 `scripts/output/well_auto_tie_<timestamp>/` 下写出结果。`--well` 只用于单井试跑；批量运行时，脚本依据顶层的 `well_usage` 选择井。
 
 建议批量跑之前先用 `--well` 各抽一口直井和一口斜井试跑。斜井路径会真实加载井轨迹并沿轨迹取道，数据问题比直井更容易暴露。
 
@@ -24,7 +24,6 @@ python scripts/well_auto_tie.py --output-dir scripts/output/<well-auto-tie-run>
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标、资产清单、井型初分、工区位置 |
-| 第二步 | `well_screen.csv` | 曲线筛选结果、每口井有哪些可用曲线 |
 | 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断基础曲线是否可用；从 `DT_USM/RHO_GCC` 构造井震标定所需的速度、密度和波阻抗 |
 | 轨迹 QC | `well_trajectory.csv` | 优先用复核后的井型替代第一步的初分 |
 | 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
@@ -48,10 +47,16 @@ seismic:
   domain: time
   zgy_inline_chunk_size: 16
 
+well_usage:
+  trusted_well_names:
+    - <trusted-well-a>
+    - <trusted-well-b>
+  background_only_well_names:
+    - <background-well-a>
+
 well_auto_tie:
   source_runs:
     well_inventory_dir: <well-inventory-run-dir>
-    well_screen_dir: <well-screen-run-dir>
     well_preprocess_dir: <well-preprocess-run-dir>
     well_trajectory_dir: <well-trajectory-qc-run-dir>
 
@@ -104,9 +109,15 @@ well_auto_tie:
 
 ### `source_runs`
 
-默认自动接上最新的前置步骤结果。复现实验时，可以按需加入 `source_runs`，填写某次第一步、第二步、第三步或轨迹 QC 的输出目录。
+默认自动接上最新的前置步骤结果。复现实验时，可以按需加入 `source_runs`，填写某次第一步、第三步或轨迹 QC 的输出目录。
 
 时深表、轨迹、井分层和地震来自顶层 `assets` / `seismic`，第四步不允许单独覆盖，避免同一轮工作流读取不同工区。
+
+### `well_usage`
+
+`well_usage` 是工作流级井角色配置，放在脚本配置段之外。`trusted_well_names` 中的井参与第四步标定；`background_only_well_names` 中的井跳过第四步，后续由第六步直接读取第三步曲线，为低频背景提供信息。未填写可信井名单时，除背景井外的井都具有标定资格；填写后，只有名单中的井具有标定资格。两份名单不能重叠。
+
+这一层只决定井是否进入第四步。曲线可用性、井位和时深覆盖范围仍由第四步自己的准入检查决定。
 
 ### `target_interval`
 
@@ -116,7 +127,7 @@ well_auto_tie:
 
 ### `enabled_routes`
 
-脚本默认启用 `vertical_with_tdt` 和 `vertical_anchor_from_tops`。将 `deviated_with_tdt` 加入启用列表后，具备时深表和轨迹的斜井也进入执行集合。各路径的输入条件与执行支持见下方“第一步：路由”表格。
+脚本默认启用前三条时间域路径：`vertical_with_tdt`、`vertical_anchor_from_tops` 和 `deviated_with_tdt`。各路径的输入条件与执行支持见下方“第一步：路由”表格。
 
 ### `coarse_correction`
 
@@ -191,7 +202,7 @@ manual_shift:
 |------|------|
 | `allow_near_outside` | 是否允许工区边缘外的井参与标定。默认只接受工区内井。 |
 | `min_tie_samples` | 实际标定窗口里至少要保留多少时间样点。 |
-| `max_short_log_gap_s` | 允许为连续滤波支撑而线性填补的内部 DT/RHO 缺口时长，默认 `0.010 s`。 |
+| `max_short_log_gap_s` | 仅为当前卷积输入连续性而临时填补的内部 DT/RHO 短缺口时长，默认 `0.010 s`；不写回持久化 LAS。 |
 | `max_trajectory_outside_fraction` | 斜井目标窗口内最多允许多少比例的轨迹样点落到工区外。 |
 
 斜井轨迹在目标窗口内采样时，部分双程旅行时样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
@@ -204,27 +215,28 @@ manual_shift:
 
 ## 脚本在做什么
 
-脚本按**路由、初始时深关系与测井窗口、地震道采样、细标定**四个阶段处理每口井。
+脚本按**准入与路由、初始坐标关系、地震道采样、细标定**四个阶段处理每口井。
 
 ### 第一步：路由
 
-合并井资产、曲线可用性、井型复核和工区位置。满足工区准入与曲线质量要求的井，按下表选择处理路径：
+先依据 `well_usage` 标记井的用途，再合并井资产、曲线可用性、井型复核和工区位置。只有具有标定资格且满足曲线与工区条件的井才进入下表：
 
 | 输入条件 | 路由名称 | 执行支持 |
 |---------|---------|---------|
 | 直井，已有时深表 | `vertical_with_tdt` | 使用已有时深关系标定 |
 | 直井，无时深表，具备井分层 | `vertical_anchor_from_tops` | 由分层与解释层位建立锚点，再沿声波曲线积分 |
 | 斜井，具备时深表和井轨迹 | `deviated_with_tdt` | 沿轨迹采样地震，再使用已有时深关系标定 |
-| 斜井，无时深表，具备井轨迹和井分层 | `deviated_anchor_from_tops` | 计划器可以识别，执行器尚未实现 |
+| 斜井，无时深表，具备井轨迹和井分层 | `deviated_anchor_from_tops` | 由锚点和声波曲线建立初始关系 |
+| 井角色为背景井或名单外井 | `well_role=background_only` / `excluded` | 记录跳过或拒绝状态，不执行标定 |
 | 输入或质量条件不满足 | `rejected` | 记录拒绝原因 |
 
-前三条路径在启用后执行；条件满足但路径未启用时，记录为待启用状态。路由计划同时保存选择结果、处理状态和原因，便于查看每口井的去向。
+默认启用前三条时间域路径；其他可识别路径需要显式加入 `enabled_routes`。条件满足但路径未启用时，记录为待启用状态。路由计划同时保存选择结果、处理状态和原因，便于查看每口井的去向。
 
 ### 第二步：准备初始时深关系、粗校正和测井窗口
 
 1. **建立初始关系。** 有时深表时读取 Petrel 时深表；无时深表时使用井分层深度与解释层位时间建立锚点，再沿声波曲线积分，得到测深到双程旅行时的关系。
 2. **应用粗校正。** 按配置把锚点校正和人工平移作用于整条时深关系；时深表只覆盖目标窗的一部分时，沿声波曲线向端点外延伸。
-3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，按双程旅行时长度线性填补短缺口，保留最长联合有效段，并检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
+3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，仅为当前卷积输入按双程旅行时长度临时填补短缺口，保留最长联合有效段，并检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
 
 ### 第三步：采样地震道
 
@@ -250,17 +262,17 @@ manual_shift:
 | `well_tie_metrics.csv` | 已执行井的标定指标和输出路径 |
 | `rejected_wells.csv` | 路由阶段被拒绝的井及原因 |
 | `tie_window_report.csv` | 目标窗口、实际窗口、TDT 来源、粗校正量和裁剪原因 |
-| `anchor_report.csv` | 使用锚点的井的锚点 MD/TWT、层位采样信息和锚点作用 |
+| `anchor_report.csv` | 时间域锚点路线的锚点 MD/TWT、层位采样信息和锚点作用 |
 | `wavelet_inventory.csv` | 成功井导出的候选子波清单，供第五步使用 |
 | `wavelets/wavelet_201ms_<well>.csv` | 裁剪并能量归一化后的子波 |
 | `time_depth/initial_tdt_<well>.csv` | 进入 `wtie` 前的初始 TDT，含 `source` 列 |
 | `time_depth/optimized_tdt_<well>.csv` | `wtie` 优化后的 TDT |
-| `petrel_checkshots/optimized_tdt_<well>.txt` | Petrel checkshots 格式的细标定后时深表，便于导入地质软件 |
-| `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS，供第五步和地质软件使用 |
+| `petrel_checkshots/optimized_tdt_<well>.txt` | 时间域细标定后的 Petrel checkshots 文件 |
+| `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS，保留原始缺口，供第五步和地质软件使用 |
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
-| `trace_sample_plan/trace_sample_plan_<well>.csv` | 斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
-| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供标定结果复查和后续处理使用 |
+| `trace_sample_plan/trace_sample_plan_<well>.csv` | 时间域斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
+| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 时间域斜井细标定后按优化 TDT 生成的样点级落道明细；直井通常没有 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
 
@@ -277,13 +289,15 @@ route_counts / route_status_counts / tie_status_counts
 planned_run_count / successful_tie_count
 ```
 
-`skipped_disabled` 多，通常是配置没启用对应路径；`failed` 集中在斜井，优先看该井的 `trace_sample_plan`，确认是不是轨迹取道或工区出界问题。
+`background_only` 或 `excluded` 多，先检查 `well_usage`；`failed` 集中在斜井时，优先看该井的 `trace_sample_plan`，确认是不是轨迹取道或工区出界问题。
 
 ### 第二步：看 `well_tie_plan.csv`
 
 确认每口井为什么走那条路径。常见标签：
 
 - `route_disabled_deviated_with_tdt`：斜井有时深但路径被禁用
+- `background_only`：按井用途配置跳过第四步
+- `excluded`：不在可信井名单中
 - `survey_position_outside`：井口不在工区内
 - `unusable_p_sonic` / `unusable_density`：第三步判定曲线不可用
 - `no_time_depth` / `no_well_trace` / `no_well_tops`：缺少路径需要的资产
@@ -294,7 +308,7 @@ planned_run_count / successful_tie_count
 - `optimized_nmae`：归一化误差，越低越好
 - `best_table_shift_ms`：`wtie` 找到的整体时移量
 - `tie_window_start_s` / `tie_window_end_s`：实际标定窗口
-- `tdt_support_class`：TDT 来源（原始表、声波拓延、锚点积分）
+- `tdt_support_class`：TDT 来源（原始表、声波拓延或锚点积分）
 - `petrel_checkshot_file`：细标定后时深表的 Petrel checkshots 导入文件
 - `filtered_las_file`：第五步默认读取的滤波后 LAS 文件
 

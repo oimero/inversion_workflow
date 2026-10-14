@@ -1,4 +1,4 @@
-"""Freeze the depth-domain forward model from rock physics and a Step-4 wavelet."""
+"""Prepare depth-domain forward inputs from rock physics and the Step-5 wavelet."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.sources import resolve_source_run
-from cup.config.workflow import WorkflowConfig
+from cup.config.workflow import WorkflowConfig, load_workflow_config
+from cup.seismic.wavelet_consensus import WAVELET_GENERATION_SCHEMA_VERSION
 from cup.physics.numpy_backend import forward_time
 from cup.synthetic.schemas import (
     DEPTH_FORWARD_MODEL_INPUTS_RUN_SCHEMA_VERSION,
@@ -28,15 +29,11 @@ from cup.synthetic.schemas import (
     ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION,
 )
 from cup.config.artifacts import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
     is_consumable_contract_status,
-    require_contract_fingerprint,
     resolve_artifact_path,
     resolve_timestamped_output_dir,
 )
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
-from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
@@ -71,7 +68,7 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     _reject_unknown(
         root,
-        {"source_runs", "source_well_name"},
+        {"source_runs"},
         path="depth_forward_model_inputs",
     )
     source_runs = _mapping(
@@ -80,21 +77,15 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     _reject_unknown(
         source_runs,
-        {"rock_physics_analysis_dir", "vertical_well_auto_tie_depth_dir"},
+        {"rock_physics_analysis_dir", "wavelet_generation_dir"},
         path="depth_forward_model_inputs.source_runs",
     )
-    source_well_name = str(root.get("source_well_name") or "").strip()
-    if not source_well_name:
-        raise ValueError(
-            "depth_forward_model_inputs.source_well_name must be non-empty."
-        )
     return {
-        "source_well_name": source_well_name,
         "source_runs": {
             key: str(source_runs.get(key) or "").strip()
             for key in (
                 "rock_physics_analysis_dir",
-                "vertical_well_auto_tie_depth_dir",
+                "wavelet_generation_dir",
             )
         },
     }
@@ -161,7 +152,6 @@ def _resolve_sources(
 ) -> dict[str, Path]:
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     configured = dict(script_config["source_runs"])
-    source_well_name = str(script_config["source_well_name"])
     return {
         "rock_physics_analysis_dir": resolve_source_run(
             configured.get("rock_physics_analysis_dir") or None,
@@ -174,23 +164,23 @@ def _resolve_sources(
             root=REPO_ROOT,
             label="rock_physics_analysis",
         ),
-        "vertical_well_auto_tie_depth_dir": resolve_source_run(
-            configured.get("vertical_well_auto_tie_depth_dir") or None,
+        "wavelet_generation_dir": resolve_source_run(
+            configured.get("wavelet_generation_dir") or None,
             output_root=output_root,
-            prefix="vertical_well_auto_tie_depth",
+            prefix="wavelet_generation",
             required_files=[
-                f"run_summary_{source_well_name}.json",
-                f"wavelet_201ms_{source_well_name}.csv",
+                "run_summary.json",
+                "selected_wavelet.csv",
             ],
             root=REPO_ROOT,
-            label="vertical_well_auto_tie_depth",
+            label="wavelet_generation",
         ),
     }
 
 
 def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     config_file = resolve_relative_path(config_path, root=REPO_ROOT)
-    raw_config = load_yaml_config(config_file)
+    raw_config = load_workflow_config(config_file, repo_root=REPO_ROOT)
     workflow = WorkflowConfig.from_mapping(raw_config)
     if workflow.seismic.domain != "depth" or workflow.seismic.depth_basis != "tvdss":
         raise ValueError(
@@ -198,7 +188,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
             "seismic.depth_basis='tvdss'."
         )
     script_config = _parse_config(raw_config)
-    source_well_name = str(script_config["source_well_name"])
     sources = _resolve_sources(workflow=workflow, script_config=script_config)
 
     rock_dir = sources["rock_physics_analysis_dir"]
@@ -225,30 +214,25 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     relation_payload = _load_json(relation_path)
     a, b, accepted_wells = _validate_relation(relation_payload)
 
-    auto_tie_dir = sources["vertical_well_auto_tie_depth_dir"]
-    auto_tie_summary_path = auto_tie_dir / f"run_summary_{source_well_name}.json"
-    auto_tie_summary = _load_json(auto_tie_summary_path)
+    wavelet_dir = sources["wavelet_generation_dir"]
+    wavelet_summary_path = wavelet_dir / "run_summary.json"
+    wavelet_summary = _load_json(wavelet_summary_path)
     if (
-        auto_tie_summary.get("schema_version") != DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
-        or not is_consumable_contract_status(auto_tie_summary.get("status"))
-        or str(auto_tie_summary.get("well_name") or "") != source_well_name
+        wavelet_summary.get("schema_version") != WAVELET_GENERATION_SCHEMA_VERSION
+        or not is_consumable_contract_status(wavelet_summary.get("status"))
+        or wavelet_summary.get("sample_domain") != "depth"
+        or wavelet_summary.get("depth_basis") != "tvdss"
     ):
-        raise ValueError("Depth auto-tie source does not match the configured source well.")
-    wavelet_path = auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"
+        raise ValueError("Selected wavelet source must be a successful depth/TVDSS fifth-step run.")
+    wavelet_path = wavelet_dir / "selected_wavelet.csv"
     wavelet_time_s, wavelet_amplitude = _load_wavelet(wavelet_path)
 
     input_contracts = {
         "rock_physics_analysis": {
             "path": repo_relative_path(rock_summary_path, root=REPO_ROOT),
-            "contract_fingerprint_sha256": require_contract_fingerprint(
-                rock_summary, label=f"rock physics run {rock_dir}"
-            ),
         },
-        "vertical_well_auto_tie_depth": {
-            "path": repo_relative_path(auto_tie_summary_path, root=REPO_ROOT),
-            "contract_fingerprint_sha256": require_contract_fingerprint(
-                auto_tie_summary, label=f"depth auto-tie run {auto_tie_dir}"
-            ),
+        "wavelet_generation": {
+            "path": repo_relative_path(wavelet_summary_path, root=REPO_ROOT),
         },
     }
     source_runs = {
@@ -260,7 +244,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "sample_domain": "depth",
         "depth_basis": "tvdss",
         "wavelet": {
-            "source_well": source_well_name,
+            "selection_mode": wavelet_summary["selection_mode"],
             "path": repo_relative_path(wavelet_path, root=REPO_ROOT),
             "time_unit": "s",
             "sample_count": int(wavelet_time_s.size),
@@ -291,19 +275,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=False)
     forward_inputs_path = output_dir / "forward_model_inputs.json"
     write_json(forward_inputs_path, forward_inputs)
-    contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=RUN_SCHEMA,
-        semantics={
-            "sample_domain": "depth",
-            "sample_unit": "m",
-            "depth_basis": "tvdss",
-            "forward_inputs_schema": FORWARD_INPUTS_SCHEMA,
-            "relation_schema": RELATION_SCHEMA,
-        },
-        business_config={"source_well_name": source_well_name},
-        input_contracts=input_contracts,
-        primary_artifacts={"forward_model_inputs": forward_inputs_path},
-    )
     summary = {
         "schema": RUN_SCHEMA,
         "script": "depth_forward_model_inputs.py",
@@ -312,7 +283,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "sample_domain": "depth",
         "sample_unit": "m",
         "depth_basis": "tvdss",
-        "source_well_name": source_well_name,
         "source_runs": source_runs,
         "input_contracts": input_contracts,
         "artifacts": {
@@ -320,8 +290,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
                 "path": repo_relative_path(forward_inputs_path, root=REPO_ROOT),
             },
         },
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": contract_fingerprint,
     }
     write_json(output_dir / "run_summary.json", summary)
     return output_dir

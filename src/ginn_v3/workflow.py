@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+import json
 import random
 from typing import Any, Mapping, Sequence
 
@@ -17,7 +18,9 @@ import numpy as np
 import torch
 
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
+from cup.config.artifacts import is_consumable_contract_status, latest_checked_run
 from cup.lfm.artifacts import load_lfm_input
+from cup.lfm.contracts import RUN_SCHEMA as LFM_RUN_SCHEMA
 from cup.physics.relations import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
@@ -207,26 +210,102 @@ def _required_input(section: Mapping[str, Any], key: str, override: object = Non
     return value
 
 
-def _resolve_inputs(section: Mapping[str, Any], overrides: _Overrides) -> tuple[Path, Path, str]:
-    lfm_run_dir = resolve_relative_path(
-        _required_input(section, "lfm_run_dir", overrides.lfm_run_dir), root=REPO_ROOT
-    )
-    well_control_run_dir = resolve_relative_path(
-        _required_input(section, "well_control_run_dir", overrides.well_control_run_dir), root=REPO_ROOT
-    )
+def _resolve_inputs(
+    section: Mapping[str, Any], overrides: _Overrides, *, workflow: WorkflowConfig
+) -> tuple[Path, Path, str]:
+    inputs = section.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise ValueError("ginn_v3_body_inversion.inputs must be a mapping.")
+    lfm_value = overrides.lfm_run_dir
+    if lfm_value is None:
+        lfm_value = str(inputs.get("lfm_run_dir") or "").strip()
+    if str(lfm_value or "").strip():
+        lfm_run_dir = resolve_relative_path(str(lfm_value), root=REPO_ROOT)
+    else:
+        output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+        def validate_lfm(path: Path) -> None:
+            summary_path = path / "lfm_run_summary.json"
+            with summary_path.open("r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            if summary.get("schema_version") != LFM_RUN_SCHEMA or not is_consumable_contract_status(summary.get("status")):
+                raise ValueError("LFM run is not a successful real_field_lfm_run_v3 artifact.")
+            axis = dict(summary.get("sample_axis") or {})
+            if axis.get("sample_domain") != workflow.seismic.domain or summary.get("depth_basis") != workflow.seismic.depth_basis:
+                raise ValueError("LFM run domain does not match the workflow seismic domain.")
+        lfm_run_dir = latest_checked_run(
+            output_root,
+            "real_field_lfm",
+            required_files=["lfm_run_summary.json", "variant_manifest.csv"],
+            validator=validate_lfm,
+        )
+    controls_value = overrides.well_control_run_dir
+    if controls_value is None:
+        controls_value = str(inputs.get("well_control_run_dir") or "").strip()
+    if str(controls_value or "").strip():
+        well_control_run_dir = resolve_relative_path(str(controls_value), root=REPO_ROOT)
+    else:
+        output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+        from cup.well.controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
+        def validate_controls(path: Path) -> None:
+            with (path / "run_summary.json").open("r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            if summary.get("schema_version") != WELL_CONTROL_SCHEMA or not is_consumable_contract_status(summary.get("status")):
+                raise ValueError("Well-control run is not a successful current Step-6 artifact.")
+            axis = dict(summary.get("sample_axis") or {})
+            if axis.get("sample_domain") != workflow.seismic.domain or summary.get("depth_basis") != workflow.seismic.depth_basis:
+                raise ValueError("Well-control run domain does not match the workflow seismic domain.")
+        well_control_run_dir = latest_checked_run(
+            output_root,
+            "real_field_well_controls",
+            required_files=["run_summary.json", "well_control_manifest.csv"],
+            validator=validate_controls,
+        )
     variant_id = _required_input(section, "variant_id", overrides.variant_id)
     return lfm_run_dir, well_control_run_dir, variant_id
 
 
-def _resolve_trusted_names(section: Mapping[str, Any], overrides: _Overrides) -> tuple[str, ...]:
+def _resolve_trusted_names(
+    section: Mapping[str, Any],
+    overrides: _Overrides,
+    *,
+    controls: Any,
+    workflow: WorkflowConfig,
+) -> tuple[str, ...]:
+    central_configured = workflow.well_usage.trusted_well_names
+    central_control_names = {str(name).casefold() for name in controls.trusted_well_names}
+    if central_configured is not None:
+        missing_central = sorted(
+            str(name) for name in central_configured
+            if str(name).casefold() not in central_control_names
+        )
+        if missing_central:
+            raise ValueError(
+                "Central trusted wells are missing from the Step-6 control set: "
+                f"{missing_central}"
+            )
     value: object = overrides.trusted_well_names
     if value is None:
         value = section.get("trusted_well_names")
-    if not isinstance(value, (list, tuple)):
-        raise ValueError("ginn_v3_body_inversion.trusted_well_names must be a non-empty list.")
-    names = tuple(str(item).strip() for item in value)
+    if value is None:
+        names = tuple(str(name) for name in controls.trusted_well_names)
+    else:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("ginn_v3_body_inversion.trusted_well_names must be a list when provided.")
+        names = tuple(str(item).strip() for item in value)
     if not names or any(not item for item in names) or len(set(name.casefold() for name in names)) != len(names):
         raise ValueError("trusted_well_names must contain unique non-empty names.")
+    central = (
+        {str(name).casefold() for name in central_configured}
+        if central_configured is not None else central_control_names
+    )
+    if any(str(name).casefold() not in central for name in names):
+        invalid = sorted(str(name) for name in names if str(name).casefold() not in central)
+        raise ValueError(f"GINN trusted_well_names must be a subset of central trusted wells: {invalid}")
+    invalid_roles = sorted(
+        str(name) for name in names if workflow.well_usage.role_for(str(name)) != "trusted"
+    )
+    if invalid_roles:
+        raise ValueError(f"GINN supervision may only use trusted wells: {invalid_roles}")
     return names
 
 
@@ -370,7 +449,7 @@ def _resolve_runtime(
         if kernel_time_s is None else np.asarray(kernel_time_s, dtype=np.float64).copy()
     )
     workflow = WorkflowConfig.from_mapping(raw)
-    lfm_run_dir, well_control_run_dir, variant_id = _resolve_inputs(section, overrides)
+    lfm_run_dir, well_control_run_dir, variant_id = _resolve_inputs(section, overrides, workflow=workflow)
     lfm = load_lfm_input(
         {
             "lfm_run_dir": str(lfm_run_dir),
@@ -414,7 +493,7 @@ def _resolve_runtime(
         sample_axis=sample_axis,
         geometry=survey.line_geometry,
     )
-    trusted_names = _resolve_trusted_names(section, overrides)
+    trusted_names = _resolve_trusted_names(section, overrides, controls=controls, workflow=workflow)
     data = prepare_training_data(
         source,
         np.asarray(lfm.log_ai),

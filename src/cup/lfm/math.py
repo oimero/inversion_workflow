@@ -95,10 +95,6 @@ def apply_lfm_lowpass(log: grid.Log, spec: LowpassSpec) -> grid.Log:
     min_length = 3 * (2 * sos.shape[0] + 1)
     for start, stop in true_runs(np.isfinite(values)):
         segment = values[start:stop]
-        if segment.size < min_length:
-            raise ValueError(
-                f"Finite log run [{start}:{stop}] has {segment.size} samples; filter requires at least {min_length}."
-            )
         if spec.buffer_mode == "none" or pad_samples == 0:
             padded = segment
             crop = slice(None)
@@ -106,6 +102,11 @@ def apply_lfm_lowpass(log: grid.Log, spec: LowpassSpec) -> grid.Log:
             mode = "reflect" if spec.buffer_mode == "reflect" else "edge"
             padded = np.pad(segment, pad_samples, mode=mode)
             crop = slice(pad_samples, pad_samples + segment.size)
+        if padded.size < min_length:
+            raise ValueError(
+                f"Finite log run [{start}:{stop}] has {segment.size} samples and "
+                f"{padded.size} after buffering; filter requires at least {min_length}."
+            )
         output[start:stop] = sosfiltfilt(sos, padded, padtype=None)[crop]
     return grid.Log(output, log.basis.copy(), "twt" if log.is_twt else "tvdss", name=log.name, unit=log.unit)
 

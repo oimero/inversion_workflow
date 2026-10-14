@@ -8,6 +8,8 @@
 
 ::: cup.well.las
 
+::: cup.well.gaps
+
 ::: cup.well.preprocess
 
 ::: cup.well.auto_tie
@@ -17,5 +19,7 @@
 ::: cup.well.controls
 
 ::: cup.well.tie
+
+::: cup.well.evaluation_support
 
 ::: cup.well.trajectory

@@ -1,7 +1,9 @@
-"""Canonical per-well support used by Step 6 and Step 8 waveform evaluation.
+"""Fixed per-well curve support used by Step 6 and Step 8 evaluation.
 
 The support is a property of the interpreted target interval and the available
-observed/well curves.  A later prediction may cover less of it, but that does
+seismic and computed well curves.  Repaired short gaps belong to computed
+curve support; the original well-observation mask is provenance only.
+A later prediction may cover less of it, but that does
 not redefine the evaluation window.
 """
 
@@ -17,10 +19,10 @@ import numpy as np
 from cup.seismic.geometry import SampleAxis
 
 
-EVALUATION_SUPPORT_SCHEMA = "well_evaluation_support_v1"
+EVALUATION_SUPPORT_SCHEMA = "well_evaluation_support_v2"
 MIN_EVALUATION_SUPPORT_SAMPLES = 8
 SUPPORT_RULE = (
-    "target_interval AND observed_support AND well_curve_support AND "
+    "target_interval AND seismic_support AND computed_well_curve_support AND "
     "additional_finite_support; choose the longest contiguous run"
 )
 
@@ -163,6 +165,8 @@ def derive_evaluation_support(
     ``target_interval`` is inclusive in coordinate space.  The returned
     indices are half-open so the same interval can be applied to Step 6 and
     Step 8 arrays without recomputing a longest run from predictions.
+    ``observed_support`` describes available seismic samples, independently
+    of which well-curve samples were repaired.
     """
 
     axis = _validate_axis(sample_axis)

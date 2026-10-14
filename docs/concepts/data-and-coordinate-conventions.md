@@ -27,12 +27,12 @@
 - 标准预处理 LAS 读取入口：`cup.well.las.load_vp_rho_logset_from_standard_las(path)`。
     - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
     - 入口只读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`；不会静默插值缺失值，即使 LAS 含 `AI`，也不会读取或校验旧 AI。
-    - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`。
-    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.tie`。
+    - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`；第四步产物还读取 `AI_OBSERVED`，其中 1 表示原始 DT/RHO 同时有效，0 表示短缺口修复值。
+    - 短缺口时长按当前井的时深关系换算为双程旅行时；短缺口修复由 `cup.well.gaps` 统一执行，第四步标定窗口仍由 `cup.well.tie` 组织。
 - 时间域第三、四步成功导出的 LAS 固定含 `AI`：
     - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
-    - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
-    - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
+    - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI；短缺口已按第四步阈值修复，长缺口仍为空值。
+    - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。第四步 LAS 的 `AI_OBSERVED` 保留原始 DT/RHO 共同观测支撑。
 
 ## 时深表
 

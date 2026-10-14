@@ -14,7 +14,7 @@ from cup.utils.statistics import radius_connected_components
 from cup.well.inventory import normalize_well_name
 from cup.well.las import load_standard_vp_rho_logs
 from cup.well.tie import (
-    WELL_AUTO_TIE_SCHEMA_VERSION, fill_short_joint_gaps, regular_tie_dt,
+    WELL_AUTO_TIE_SCHEMA_VERSION, regular_tie_dt,
     resample_tie_seismic_to_dt, scaled_synthetic_metrics, tie_text, well_rows_by_name,
 )
 from cup.well.trajectory import crop_logset_md, load_workflow_time_depth_table_csv
@@ -443,14 +443,17 @@ def load_continuous_tie_evaluation_inputs(
     well_artifact: TieEvaluationWell,
 ) -> tuple[Any, Any, Any]:
     """Load and crop fourth-step artifacts to one gap-free evaluation window."""
-    standard = load_standard_vp_rho_logs(well_artifact.input_las)
+    standard = load_standard_vp_rho_logs(
+        well_artifact.input_las,
+        require_observation_mask=True,
+    )
     table = load_workflow_time_depth_table_csv(well_artifact.optimized_tdt_file)
     seismic = load_saved_seismic_trace_csv(well_artifact.seismic_trace_file)
-    evaluation_logs, filled_gap_mask = fill_short_joint_gaps(
-        standard,
-        table,
-        max_short_gap_s=float(well_artifact.max_short_log_gap_s),
-    )
+    # Step 4 persists repaired short gaps in the filtered LAS.  Step 5 reads
+    # that exact artifact and rejects any remaining long gap in the saved
+    # continuous tie window; it must not silently create a second repair.
+    evaluation_logs = standard.logs
+    filled_gap_mask = np.asarray(standard.filled_gap_mask, dtype=bool)
 
     start_s = max(float(seismic.basis[0]), float(table.twt[0]))
     end_s = min(float(seismic.basis[-1]), float(table.twt[-1]))

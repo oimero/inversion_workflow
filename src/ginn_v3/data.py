@@ -14,7 +14,6 @@ from typing import Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
 import torch
-from torch import Tensor
 
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.well.controls import WellControl, WellControlSet
@@ -752,9 +751,8 @@ def build_well_targets(
         evaluation_mask = _support_mask(support, controls.sample_axis)
         target = _resample_native_runs(control)
         model_valid = np.asarray(control.valid_mask, dtype=bool)
-        observed_valid = np.asarray(control.observed_valid_mask, dtype=bool)
         _lfm_trace, lfm_valid = _weighted_volume_trace(values, masks, trace_weights)
-        valid = np.isfinite(target) & model_valid & observed_valid & lfm_valid
+        valid = np.isfinite(target) & model_valid & lfm_valid
         if np.any(evaluation_mask & ~valid):
             missing = int(np.count_nonzero(evaluation_mask & ~valid))
             raise ValueError(

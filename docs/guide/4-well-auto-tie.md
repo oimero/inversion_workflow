@@ -202,8 +202,10 @@ manual_shift:
 |------|------|
 | `allow_near_outside` | 是否允许工区边缘外的井参与标定。默认只接受工区内井。 |
 | `min_tie_samples` | 实际标定窗口里至少要保留多少时间样点。 |
-| `max_short_log_gap_s` | 仅为当前卷积输入连续性而临时填补的内部 DT/RHO 短缺口时长，默认 `0.010 s`；不写回持久化 LAS。 |
+| `max_short_log_gap_s` | 按当前井的双程旅行时判断内部 DT/RHO 短缺口是否可修复，默认 `0.010 s`。修复结果写入第四步滤波 LAS；超过阈值的长缺口继续保留为空值。 |
 | `max_trajectory_outside_fraction` | 斜井目标窗口内最多允许多少比例的轨迹样点落到工区外。 |
+
+短缺口的时长按当前井的时深关系换算为双程旅行时。内部 DT/RHO 联合有效性断开的区段若不超过阈值，第四步用两侧有限样点线性插值修复，再参与滤波和正演；端点缺失、无法建立时长的缺口以及超过阈值的长缺口保持无效。导出的滤波 LAS 保存修复后的曲线，并增加 `AI_OBSERVED`：原始 DT/RHO 同时有效的样点为 1，短缺口修复样点为 0。这样后续步骤可以使用连续数值，同时仍能区分原始观测与修复值。
 
 斜井轨迹在目标窗口内采样时，部分双程旅行时样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
 
@@ -236,7 +238,7 @@ manual_shift:
 
 1. **建立初始关系。** 有时深表时读取 Petrel 时深表；无时深表时使用井分层深度与解释层位时间建立锚点，再沿声波曲线积分，得到测深到双程旅行时的关系。
 2. **应用粗校正。** 按配置把锚点校正和人工平移作用于整条时深关系；时深表只覆盖目标窗的一部分时，沿声波曲线向端点外延伸。
-3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，仅为当前卷积输入按双程旅行时长度临时填补短缺口，保留最长联合有效段，并检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
+3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，按双程旅行时阈值修复内部短缺口；长缺口保持无效，并在目标窗口内选择最长的联合有效段，检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
 
 ### 第三步：采样地震道
 
@@ -268,13 +270,13 @@ manual_shift:
 | `time_depth/initial_tdt_<well>.csv` | 进入 `wtie` 前的初始 TDT，含 `source` 列 |
 | `time_depth/optimized_tdt_<well>.csv` | `wtie` 优化后的 TDT |
 | `petrel_checkshots/optimized_tdt_<well>.txt` | 时间域细标定后的 Petrel checkshots 文件 |
-| `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS，保留原始缺口，供第五步和地质软件使用 |
+| `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS；短缺口已修复，长缺口仍为空值，并用 `AI_OBSERVED` 标记原始观测支撑，供第五步和后续步骤使用 |
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
 | `trace_sample_plan/trace_sample_plan_<well>.csv` | 时间域斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
 | `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 时间域斜井细标定后按优化 TDT 生成的样点级落道明细；直井通常没有 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
-| `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
+| `run_summary.json` | `well_auto_tie_v5` 输入契约、路由统计、失败统计、短缺口阈值和逐井补充信息 |
 
 ---
 
@@ -311,6 +313,7 @@ planned_run_count / successful_tie_count
 - `tdt_support_class`：TDT 来源（原始表、声波拓延或锚点积分）
 - `petrel_checkshot_file`：细标定后时深表的 Petrel checkshots 导入文件
 - `filtered_las_file`：第五步默认读取的滤波后 LAS 文件
+- `max_short_log_gap_s`：本次运行采用的短缺口双程旅行时阈值；滤波 LAS 中的修复值由 `AI_OBSERVED=0` 标记
 
 相关系数提高不等于结果可靠——必须结合 TDT 图、合成匹配图和子波形态一起看。
 

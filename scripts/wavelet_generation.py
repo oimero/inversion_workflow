@@ -503,7 +503,7 @@ def _plot_batch_synthetic_qc(
         title = f"Batch synthetic | corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}"
     fig, _axes = plot_well_waveform_qc(
         grid.Log(ai_values, twt_s, basis_type, name="AI"),
-        grid.Reflectivity(reflectivity, twt_s, basis_type, name="Reflectivity"),
+        grid.Log(reflectivity, twt_s, basis_type, name="Reflectivity"),
         synthetic_trace,
         seismic_trace,
         xcorr,

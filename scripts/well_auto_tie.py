@@ -275,7 +275,6 @@ def _metrics_with_extras(
             "target_top_tvdss_m": report.get("target_top_tvdss_m"),
             "target_bottom_tvdss_m": report.get("target_bottom_tvdss_m"),
             "filtered_las_file": extra.get("filtered_las_file"),
-            "optimized_tdt_file": extra.get("optimized_tdt_file") or result.optimized_tdt_file,
             "seismic_trace_file": extra.get("seismic_trace_file"),
             "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
             "optimized_trace_sample_plan_file": extra.get("optimized_trace_sample_plan_file"),
@@ -500,6 +499,8 @@ def _run_workflow(
         "sample_domain": domain,
         "sample_unit": "s" if domain == "time" else "m",
         "depth_basis": "tvdss" if domain == "depth" else None,
+        "max_short_log_gap_s": float(script_cfg["reject"]["max_short_log_gap_s"]),
+        "gap_policy": "persist_repaired_short_gaps",
         "script": "well_auto_tie.py",
         "config_file": repo_relative_path(config_path, root=repo_root),
         "inputs": {

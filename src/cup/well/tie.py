@@ -11,10 +11,11 @@ import pandas as pd
 
 from cup.utils.masks import true_runs
 from cup.well.inventory import normalize_well_name
+from cup.well.gaps import _gap_duration_s, fill_short_joint_gaps
 from cup.well.las import StandardVpRhoLogs
 from wtie.processing import grid
 
-WELL_AUTO_TIE_SCHEMA_VERSION = "well_auto_tie_v4"
+WELL_AUTO_TIE_SCHEMA_VERSION = "well_auto_tie_v5"
 
 
 @dataclass(frozen=True)
@@ -68,70 +69,6 @@ class WellTieResult:
 
     def to_row(self) -> dict[str, Any]:
         return asdict(self)
-
-
-def _gap_duration_s(
-    md: np.ndarray,
-    start: int,
-    stop: int,
-    table: grid.TimeDepthTable,
-) -> float:
-    left = max(0, start - 1)
-    right = min(md.size - 1, stop)
-    if not table.is_md_domain:
-        raise ValueError("Gap-aware standard LAS processing requires an MD-domain TimeDepthTable.")
-    if md[left] < table.md[0] or md[right] > table.md[-1]:
-        return float("inf")
-    return float(
-        np.interp(md[right], table.md, table.twt)
-        - np.interp(md[left], table.md, table.twt)
-    )
-
-
-def fill_short_joint_gaps(
-    standard: StandardVpRhoLogs,
-    table: grid.TimeDepthTable,
-    *,
-    max_short_gap_s: float,
-) -> tuple[grid.LogSet, np.ndarray]:
-    """Fill bounded joint-invalid runs whose mapped TWT duration is short."""
-    if not table.is_md_domain:
-        raise ValueError("Gap-aware standard LAS processing requires an MD-domain TimeDepthTable.")
-    if not np.isfinite(max_short_gap_s) or max_short_gap_s < 0.0:
-        raise ValueError("max_short_gap_s must be finite and non-negative.")
-    md = np.asarray(standard.logs.basis, dtype=np.float64)
-    vp = np.asarray(standard.logs.Vp.values, dtype=np.float64).copy()
-    rho = np.asarray(standard.logs.Rho.values, dtype=np.float64).copy()
-    joint_valid = np.isfinite(vp) & (vp > 0.0) & np.isfinite(rho) & (rho > 0.0)
-    filled = np.zeros(md.shape, dtype=bool)
-    for start, stop in true_runs(~joint_valid):
-        if start == 0 or stop == md.size:
-            continue
-        duration = _gap_duration_s(md, start, stop, table)
-        if duration > float(max_short_gap_s) + 1e-12:
-            continue
-        vp[start:stop] = np.interp(
-            md[start:stop],
-            md[[start - 1, stop]],
-            vp[[start - 1, stop]],
-        )
-        rho[start:stop] = np.interp(
-            md[start:stop],
-            md[[start - 1, stop]],
-            rho[[start - 1, stop]],
-        )
-        filled[start:stop] = True
-    logs = grid.LogSet(
-        {
-            "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s", allow_nan=True),
-            "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=True),
-        }
-    )
-    # These masks describe the temporary forward-evaluation logset.  The
-    # exported Step-4 LAS is still written from the original observations.
-    logs.observed_mask = np.asarray(standard.observed_mask, dtype=bool).copy()
-    logs.filled_gap_mask = filled.copy()
-    return logs, filled
 
 
 def prepare_continuous_tie_logs(

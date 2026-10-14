@@ -68,7 +68,7 @@ def _controls(log_ai, axis, x_m, roles):
         values = np.asarray(log_ai[index], dtype=float)
         mask = np.isfinite(values)
         provenance = {"source": "Marmousi2 synthetic pseudo-well", "role": "train", "extra_smoothing": False}
-        native = NativeWellControl(name, axis.values, values, mask, "time", "s", None, provenance)
+        native = NativeWellControl(name, axis.values, values, mask, mask.copy(), "time", "s", None, provenance)
         n = len(values)
         controls.append(WellControl(
             name, axis, grid.Log(values, axis.values, "twt", name=name, unit="log(m/s*g/cm3)"),

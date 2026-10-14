@@ -29,6 +29,7 @@ from cup.utils.coerce import as_bool
 from cup.utils.coerce import as_bool as _as_bool, optional_float as _optional_float
 from cup.utils.io import repo_relative_path, resolve_relative_path, sanitize_filename
 from cup.utils.masks import true_runs
+from cup.well.gaps import fill_short_depth_gaps
 from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.las import StandardVpRhoLogs, load_standard_vp_rho_logs
 from cup.well.tie import (
@@ -196,24 +197,43 @@ def export_filtered_las(
     table: grid.TimeDepthTable,
     max_short_gap_s: float,
     well_name: str,
+    depth_coordinates: np.ndarray | None = None,
 ) -> Path:
     from cup.well.las import export_logset_to_las
 
     standard = load_standard_vp_rho_logs(input_las)
-    # The optimizer and the persisted curves share the same temporary input:
-    # fill only bounded short gaps, filter, then restore the original mask.
-    export_logset, _filled = fill_short_joint_gaps(standard, table, max_short_gap_s=max_short_gap_s)
+    # The optimizer and the persisted curves share the same repaired input:
+    # fill only bounded short gaps, filter, and persist the repair mask.
+    # A depth route carries the exact MD-aligned depth coordinates used before
+    # local TDT construction.  Reusing them keeps export and mapping on the
+    # same physical two-way-time criterion; time routes use their MD-TDT.
+    if depth_coordinates is None:
+        export_logset, _filled = fill_short_joint_gaps(
+            standard,
+            table,
+            max_short_gap_s=max_short_gap_s,
+        )
+    else:
+        export_logset, _filled = fill_short_depth_gaps(
+            standard,
+            depth_coordinates,
+            max_short_gap_s=max_short_gap_s,
+        )
     filtered = filtered_standard_las_logset(export_logset, best_params)
-    observed = np.asarray(standard.observed_mask, dtype=bool)
-    for log in filtered.values():
-        values = np.asarray(log.values, dtype=np.float64).copy()
-        values[~observed] = np.nan
-        log.values[:] = values
+    basis = np.asarray(standard.logs.basis, dtype=np.float64)
+    filtered["AI_OBSERVED"] = grid.Log(
+        np.asarray(standard.observed_mask, dtype=np.float64),
+        basis,
+        "md",
+        name="AI_OBSERVED",
+        unit="1",
+        allow_nan=False,
+    )
     return export_logset_to_las(
         well_name,
         filtered,
         output_path,
-        curve_names=["DT_USM", "RHO_GCC", "AI"],
+        curve_names=["DT_USM", "RHO_GCC", "AI", "AI_OBSERVED"],
         template_las=input_las,
     )
 
@@ -893,6 +913,7 @@ class DepthPrepared:
     target_top_tvdss_m: float
     target_bottom_tvdss_m: float
     trajectory: WellTrajectory | None
+    depth_coordinates: np.ndarray
 
 def _target_horizon_values(config: dict[str, Any]) -> tuple[Any, Any]:
     target = dict(config.get("target_interval") or {})
@@ -999,65 +1020,6 @@ def _valid_segments(standard: Any, trajectory: WellTrajectory | None) -> list[tu
             raise ValueError("Depth-domain well trajectory must have strictly increasing TVDSS in each valid log segment.")
         out.append((start, stop, md_seg, tvdss, vp[start:stop]))
     return out
-
-def _fill_short_depth_gaps(
-    standard: StandardVpRhoLogs,
-    *,
-    kb_m: float,
-    trajectory: WellTrajectory | None,
-    max_gap_s: float,
-) -> tuple[StandardVpRhoLogs, dict[str, float | int]]:
-    """Fill only bounded joint gaps whose two-way depth duration is short.
-
-    The original LAS object remains untouched and is used for the exported
-    filtered LAS.  This copy is solely the local TDT mapping input.
-    """
-    md = np.asarray(standard.logs.basis, dtype=np.float64)
-    vp = np.asarray(standard.logs.Vp.values, dtype=np.float64).copy()
-    rho = np.asarray(standard.logs.Rho.values, dtype=np.float64).copy()
-    valid = np.isfinite(vp) & (vp > 0.0) & np.isfinite(rho) & (rho > 0.0)
-    if not np.isfinite(max_gap_s) or max_gap_s < 0.0:
-        raise ValueError("max_short_log_gap_s must be finite and non-negative.")
-    filled = np.zeros(md.shape, dtype=bool)
-    long_gaps: list[float] = []
-
-    if trajectory is None:
-        if not np.isfinite(kb_m):
-            raise ValueError("Depth gap evaluation requires finite KB.")
-        depth = md - float(kb_m)
-    else:
-        if md[0] < trajectory.md_m[0] or md[-1] > trajectory.md_m[-1]:
-            raise ValueError("Well log MD support lies outside the trajectory MD support.")
-        depth = np.interp(md, trajectory.md_m, trajectory.tvdss_m)
-
-    for start, stop in true_runs(~valid):
-        if start == 0 or stop == md.size:
-            continue
-        left, right = start - 1, stop
-        if not (np.isfinite(depth[left]) and np.isfinite(depth[right])):
-            raise ValueError("Cannot evaluate a depth-domain log gap without finite trajectory depth.")
-        vp_left, vp_right = vp[left], vp[right]
-        if not (np.isfinite(vp_left) and np.isfinite(vp_right) and vp_left > 0.0 and vp_right > 0.0):
-            long_gaps.append(float("inf"))
-            continue
-        duration_s = 2.0 * abs(float(depth[right] - depth[left])) / (0.5 * (float(vp_left) + float(vp_right)))
-        if duration_s <= float(max_gap_s) + 1e-12:
-            vp[start:stop] = np.interp(md[start:stop], md[[left, right]], vp[[left, right]])
-            rho[start:stop] = np.interp(md[start:stop], md[[left, right]], rho[[left, right]])
-            filled[start:stop] = True
-        else:
-            long_gaps.append(duration_s)
-    logs = grid.LogSet(
-        {
-            "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s", allow_nan=True),
-            "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=True),
-        }
-    )
-    return StandardVpRhoLogs(logs=logs, observed_mask=standard.observed_mask), {
-        "short_gap_filled_samples": int(np.count_nonzero(filled)),
-        "long_gap_count": int(len(long_gaps)),
-        "longest_long_gap_s": float(max(long_gaps, default=0.0)),
-    }
 
 def _vertical_segments(standard: Any, kb_m: float) -> list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray]]:
     md = np.asarray(standard.logs.basis, dtype=np.float64)
@@ -1232,11 +1194,27 @@ def prepare_depth_route(
     dt_s = float(config.get("wavelet_sampling_s", 0.002))
     if not np.isfinite(dt_s) or dt_s <= 0.0:
         raise ValueError("wavelet_sampling_s must be positive and finite.")
-    mapping_standard, gap_report = _fill_short_depth_gaps(
+    md_axis = np.asarray(standard.logs.basis, dtype=np.float64)
+    if trajectory is None:
+        depth_coordinates = md_axis - float(plan.kb_m)
+    else:
+        depth_coordinates = np.interp(
+            md_axis,
+            trajectory.md_m,
+            trajectory.tvdss_m,
+            left=np.nan,
+            right=np.nan,
+        )
+    mapping_logs, _filled_depth_gaps = fill_short_depth_gaps(
         standard,
-        kb_m=float(plan.kb_m),
-        trajectory=trajectory,
-        max_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+        depth_coordinates,
+        max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+    )
+    gap_report = dict(getattr(mapping_logs, "gap_report", {}))
+    mapping_standard = StandardVpRhoLogs(
+        logs=mapping_logs,
+        observed_mask=standard.observed_mask,
+        filled_gap_mask=_filled_depth_gaps,
     )
     if trajectory is None:
         segments = _vertical_segments(mapping_standard, float(plan.kb_m))
@@ -1283,6 +1261,8 @@ def prepare_depth_route(
             "Rho": grid.Log(selected_rho, md, "md", name="Rho", unit="g/cm3", allow_nan=False),
         }
     )
+    selected_logset.observed_mask = np.asarray(standard.observed_mask, dtype=bool)[_start:_stop].copy()
+    selected_logset.filled_gap_mask = np.asarray(mapping_standard.filled_gap_mask, dtype=bool)[_start:_stop].copy()
     prepared = _windowed_prepared(
         table=table,
         logset_md=selected_logset,
@@ -1352,6 +1332,7 @@ def prepare_depth_route(
         target_top_tvdss_m=float(target_top_depth),
         target_bottom_tvdss_m=float(target_bottom_depth),
         trajectory=trajectory,
+        depth_coordinates=depth_coordinates,
     )
 
 def write_depth_artifacts(
@@ -1639,6 +1620,7 @@ def execute_well(
         table=outputs.table,
         max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
         well_name=plan.well_name,
+        depth_coordinates=None if depth_prepared is None else depth_prepared.depth_coordinates,
     )
     checkshot_path = None
     if sample_domain == "time":

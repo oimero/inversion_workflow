@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from cup.physics.support import longest_true_run
 from cup.utils.io import sanitize_filename, write_json
 
 
@@ -64,17 +65,40 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
         if support.shape != axis.values.shape or np.count_nonzero(support) < 8:
             raise ValueError(f"{well.well_name}: Step-6 evaluation support is invalid.")
         available = (learned.valid_mask[0] & obs.observed_mask[0]).cpu().numpy()
-        if np.any(support & ~available) or np.any(support & ~well.valid_mask):
-            raise ValueError(f"{well.well_name}: prediction does not cover the complete fixed Step-6 support.")
+        if np.any(support & ~well.valid_mask):
+            raise ValueError(
+                f"{well.well_name}: fixed Step-6 impedance support contains unsupported target samples."
+            )
+        effective_waveform = support & available
+        effective_count = int(np.count_nonzero(effective_waveform))
+        try:
+            waveform_start, waveform_stop = longest_true_run(
+                effective_waveform,
+                minimum_samples=8,
+            )
+        except ValueError as exc:
+            fixed_count = int(np.count_nonzero(support))
+            raise ValueError(
+                f"{well.well_name}: complete forward response covers only {effective_count} of "
+                f"{fixed_count} fixed Step-6 samples; the learned kernel support cannot evaluate "
+                "the fixed waveform interval."
+            ) from exc
+        waveform_support = np.zeros_like(support)
+        waveform_support[waveform_start:waveform_stop] = True
+        waveform_count = waveform_stop - waveform_start
         predicted = prediction.log_ai[0].cpu().numpy().astype(np.float64)
         baseline = obs.initial_log_ai[0].cpu().numpy().astype(np.float64)
         observed = obs.observed_seismic[0].cpu().numpy().astype(np.float64)
         synthesized = learned.seismic[0].cpu().numpy().astype(np.float64) * norm.seismic_std + norm.seismic_mean
         truth = np.asarray(well.log_ai, dtype=np.float64)
-        for values in (predicted, baseline, observed, synthesized, truth):
+        for values in (predicted, baseline, truth):
             if not np.all(np.isfinite(values[support])):
-                raise ValueError(f"{well.well_name}: nonfinite value on fixed evaluation support.")
+                raise ValueError(f"{well.well_name}: nonfinite impedance value on fixed evaluation support.")
+        for values in (observed, synthesized):
+            if not np.all(np.isfinite(values[waveform_support])):
+                raise ValueError(f"{well.well_name}: nonfinite waveform value on complete forward support.")
         selected = np.flatnonzero(support)
+        selected_waveform = np.flatnonzero(waveform_support)
         record = {
             "well_name": well.well_name,
             "role": "training" if well.well_name in trusted else "held_out",
@@ -82,9 +106,14 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
             "support_start_index": int(selected[0]), "support_stop_index": int(selected[-1]) + 1,
             "support_start": float(axis.values[selected[0]]), "support_stop": float(axis.values[selected[-1]]),
             "support_samples": int(selected.size),
+            "waveform_support_start_index": int(selected_waveform[0]),
+            "waveform_support_stop_index": int(selected_waveform[-1]) + 1,
+            "waveform_support_start": float(axis.values[selected_waveform[0]]),
+            "waveform_support_stop": float(axis.values[selected_waveform[-1]]),
+            "waveform_support_samples": waveform_count,
             "log_ai_rmse": float(np.sqrt(np.mean((predicted[support] - truth[support]) ** 2))),
             "lfm_log_ai_rmse": float(np.sqrt(np.mean((baseline[support] - truth[support]) ** 2))),
-            "learned_global_correlation": _correlation(observed[support], synthesized[support]),
+            "learned_global_correlation": _correlation(observed[waveform_support], synthesized[waveform_support]),
             "prediction_tv": _roughness(predicted[support])["tv"],
             "truth_tv": _roughness(truth[support])["tv"],
             "prediction_turns": _roughness(predicted[support])["turns"],
@@ -93,8 +122,10 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
         records.append(record)
         folder = output / sanitize_filename(well.well_name)
         folder.mkdir(parents=True, exist_ok=True)
+        observed_for_csv = np.where(waveform_support, observed, np.nan)
+        synthesized_for_csv = np.where(waveform_support, synthesized, np.nan)
         columns = np.column_stack((axis.values[support], truth[support], baseline[support], predicted[support],
-                                   observed[support], synthesized[support]))
+                                   observed_for_csv[support], synthesized_for_csv[support]))
         np.savetxt(folder / "curves.csv", columns, delimiter=",", comments="",
                    header="sample,truth_log_ai,lfm_log_ai,prediction_log_ai,observed_raw,learned_synthetic_raw")
     if not records:
@@ -103,7 +134,11 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
         writer = csv.DictWriter(handle, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
-    metrics = {"schema": "ginn_v3_well_qc_v2", "wavelet_cohort": wavelet_cohort,
-               "support_source": "Step-6 fixed intervals", "wells": records}
+    metrics = {
+        "schema": "ginn_v3_well_qc_v3",
+        "wavelet_cohort": wavelet_cohort,
+        "support_source": "Step-6 fixed intervals for impedance; complete forward response for waveform",
+        "wells": records,
+    }
     write_json(output / "metrics.json", metrics)
     return metrics

@@ -55,6 +55,8 @@ real_field_well_controls:
 
 三个来源目录应属于同一轮工作流，并与当前地震域、采样轴和工区几何一致。留空时脚本按输出根目录自动发现可用运行；填写目录后固定使用该次产物。
 
+第六步从所选第四步运行摘要读取短缺口阈值和缺口处理契约，可信井和背景井使用同一阈值。
+
 | 配置项 | 来源 | 用途 |
 |---|---|---|
 | `well_auto_tie_dir` | 第四步 | 可信井的标定结果、滤波曲线和域转换信息 |
@@ -73,7 +75,11 @@ real_field_well_controls:
 
 ### 缺口
 
-缺口处理由上游滤波后的 LAS 负责。第六步只在各个有限段内投影到目标采样轴，不跨缺口插值，也不在模型轴上重新填补。井控曲线和井监督掩码保留缺口；短缺口如需参与卷积或波形质检，只在该次计算的中间数组中处理，不回写到持久化曲线或观测支撑。观测支撑掩码表示投影后的上游有效支撑，缺口样点在模型轴阻抗字段和掩码中保持无效。
+第六步沿用第四步运行摘要中的 `max_short_log_gap_s`。可信井直接读取第四步已修复的滤波曲线；背景井读取第三步曲线后，按同一阈值修复内部短缺口。缺口时长由井的时深关系换算为双程旅行时。长缺口、端点缺口和无法建立时长的缺口保持无效。
+
+短缺口修复值参与后续滤波、重采样、正演和井监督。第六步在原生井轴和地震模型轴分别保存有效掩码与原始观测掩码：前者描述当前数值是否可用，后者保留声波与密度的原始共同观测信息。长缺口将曲线分成独立的有效段，各段分别重采样和正演。
+
+井曲线评价采用目的层内最长的共同有效区间，短缺口修复值属于这个区间。波形评价在井曲线区间内，按子波时间范围排除内部长缺口两侧的不完整响应，再选择最长连续区间。计算窗两端采用有限窗口截断。质检指标分别记录井曲线区间与波形区间的边界和样点数。
 
 ---
 
@@ -109,20 +115,20 @@ real_field_well_controls_<run_timestamp>/
 | 列 | 含义 |
 |------|------|
 | `well_name` | 规范化井名 |
-| `status` | `ok` 或 `failed` |
+| `status` | `ok`、`failed` 或 `excluded` |
 | `reason` | 失败原因（成功时为空） |
 | `sample_domain` | `time` |
-| `well_role` | `trusted` 或 `background_only` |
+| `well_role` | `trusted`、`background_only` 或 `excluded` |
 | `wellbore_class` | `vertical` 或 `deviated` |
 | `sampling_mode` | 具体采样方式 |
 | `n_samples` / `n_valid_samples` | 总样点数 / 有效样点数 |
-| `n_observed_samples` / `n_interpolated_samples` | 模型轴上由输入曲线投影得到的有效样点数 / 有效但未标记为观测的样点数（当前实现为 0） |
+| `n_observed_samples` / `n_interpolated_samples` | 模型轴上原始观测有效样点数 / 有效但未标记为原始观测的修复或投影样点数 |
 | `n_native_samples` / `n_valid_native_samples` | 滤波曲线原生采样总样点数 / 有效样点数 |
 | `well_npz_path` | NPZ 路径（失败时为空） |
 
-`run_summary.json` 记录采样域、井角色、原生曲线来源和缺口处理方式，并保存第六步固定评价支撑、直接上游与产物路径。
+`run_summary.json` 记录 `real_field_well_controls_v9` 井控契约、采样域、井角色、原生曲线来源、共享的短缺口阈值和缺口处理方式，并保存第六步固定评价支撑、直接上游与产物路径。
 
-`qc/evaluation_support.json` 固定每口井用于后续井标签和波形质检的共同有效区间；它由目标层位、已标定滤波曲线、地震样点和空间位置共同确定。
+`qc/evaluation_support.json` 使用 `well_evaluation_support_v2` 格式，固定每口井的井曲线评价区间，由目的层、修复后的滤波曲线、地震样点和空间位置共同确定。`qc/metrics.csv` 的 `waveform_support_start`、`waveform_support_stop` 和 `waveform_support_samples` 记录实际波形评价范围。
 
 第七步和[第八步物理约束神经网络反演](8-ginn.md)读取这一版本的逐井文件。生成井控后，将下游配置中的井控目录指向本次输出，并基于这份井控生成相应的低频模型。
 
@@ -143,6 +149,7 @@ real_field_well_controls_<run_timestamp>/
 | `native_coordinates` | float64 | [M] | 对齐后的原生 TWT 坐标 |
 | `native_filtered_log_ai` | float32 | [M] | 滤波 LAS 原生采样的 ln(AI)，无效处为 NaN |
 | `native_valid_mask` | bool | [M] | 滤波 LAS 原生采样曲线有效掩码 |
+| `native_observed_mask` | bool | [M] | 滤波 LAS 原生采样的原始观测掩码；短缺口修复样点为 false |
 | `metadata_json` | 标量字符串 | — | 井名、schema、provenance |
 
 ### `run_summary.json`
@@ -169,6 +176,7 @@ Successful wells: <successful_well_count>
 
 - **ok 井：** 关注有效样点数。有效样点数远少于总样点数说明该井的 LAS 或 TDT/轨迹覆盖范围与目标采样轴重叠有限。这在目标窗口边缘是正常的；如果一口井的有效覆盖率异常低，检查上游 LAS 的深度范围或 TDT 表的时间范围。
 - **failed 井：** 看原因列。常见原因见下一节。
+- **excluded 井：** 这是井角色配置明确排除的井，不作为失败处理，也不会写入逐井井控文件。
 
 ### 第三步：抽查一口井的 NPZ
 

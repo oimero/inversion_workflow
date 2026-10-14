@@ -87,12 +87,31 @@ class StandardVpRhoLogs:
 
     logs: grid.LogSet
     observed_mask: np.ndarray
+    filled_gap_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         mask = np.asarray(self.observed_mask, dtype=bool).reshape(-1)
         if mask.shape != np.asarray(self.logs.basis).shape:
             raise ValueError("observed_mask must match the standard LAS MD basis.")
         object.__setattr__(self, "observed_mask", mask)
+        joint_valid = (
+            np.isfinite(np.asarray(self.logs.Vp.values, dtype=np.float64))
+            & (np.asarray(self.logs.Vp.values, dtype=np.float64) > 0.0)
+            & np.isfinite(np.asarray(self.logs.Rho.values, dtype=np.float64))
+            & (np.asarray(self.logs.Rho.values, dtype=np.float64) > 0.0)
+        )
+        filled = (
+            joint_valid & ~mask
+            if self.filled_gap_mask is None
+            else np.asarray(self.filled_gap_mask, dtype=bool).reshape(-1)
+        )
+        if filled.shape != mask.shape:
+            raise ValueError("filled_gap_mask must match the standard LAS MD basis.")
+        if np.any(filled & mask) or np.any(filled & ~joint_valid):
+            raise ValueError("filled_gap_mask must mark finite repaired samples outside the observed mask.")
+        object.__setattr__(self, "filled_gap_mask", filled)
+        self.logs.observed_mask = mask.copy()
+        self.logs.filled_gap_mask = filled.copy()
 
 
 def _replace_sentinel_values(values: object, *, null_value: float | None = None, null_policy: str = "common_sentinels") -> np.ndarray:
@@ -359,8 +378,17 @@ def read_las_curves(
     return logs
 
 
-def load_standard_vp_rho_logs(path: str | Path) -> StandardVpRhoLogs:
-    """Read standard DT/Rho curves without filling missing samples."""
+def load_standard_vp_rho_logs(
+    path: str | Path,
+    *,
+    require_observation_mask: bool = False,
+) -> StandardVpRhoLogs:
+    """Read standard DT/Rho curves without filling missing samples.
+
+    Step 3 LAS files may omit ``AI_OBSERVED``; those files derive the mask
+    from the joint finite DT/Rho values.  Persisted Step 4 LAS consumers pass
+    ``require_observation_mask=True`` and therefore reject such older inputs.
+    """
     try:
         curves = read_las_curves(
             path,
@@ -400,6 +428,47 @@ def load_standard_vp_rho_logs(path: str | Path) -> StandardVpRhoLogs:
     if not np.any(rho_valid):
         raise ValueError(f"RHO_GCC contains no positive finite samples: {path}")
 
+    # Resolve presence before reading the optional curve.  A malformed or
+    # invalid present mask must raise; only a genuinely missing mask may use
+    # the Step-3 joint-finite fallback when explicitly allowed.
+    mask_las = lasio.read(str(path))
+    mask_lookup = build_las_curve_lookup(mask_las)
+    mask_present = (
+        exact_mnemonic("AI_OBSERVED") in mask_lookup.exact_index
+        or normalize_mnemonic("AI_OBSERVED") in mask_lookup.normalized_index
+    )
+    if not mask_present:
+        if require_observation_mask:
+            raise ValueError(
+                f"Standard LAS must contain AI_OBSERVED when require_observation_mask=True: {path}"
+            )
+        observation_log = None
+    else:
+        observation_log = _read_las_curve_from_lasio(
+            mask_las,
+            "AI_OBSERVED",
+            match_policy="exact_then_normalized",
+            allow_all_nan=True,
+            lookup=mask_lookup,
+            source=path,
+        )
+    if observation_log is not None:
+        if _normalize_unit(observation_log.unit) != "1":
+            raise ValueError(
+                f"Standard LAS AI_OBSERVED unit must be '1', got {observation_log.unit!r}: {path}"
+            )
+        if not np.allclose(observation_log.basis, md, equal_nan=False):
+            raise ValueError(f"AI_OBSERVED basis does not match DT_USM/RHO_GCC: {path}")
+        observation_values = np.asarray(observation_log.values, dtype=np.float64)
+        if np.any(~np.isfinite(observation_values)) or np.any(
+            ~np.isclose(observation_values, 0.0, atol=1e-8, rtol=0.0)
+            & ~np.isclose(observation_values, 1.0, atol=1e-8, rtol=0.0)
+        ):
+            raise ValueError(f"AI_OBSERVED must contain only 0 or 1 values: {path}")
+        observed_mask = np.isclose(observation_values, 1.0, atol=1e-8, rtol=0.0)
+    else:
+        observed_mask = dt_valid & rho_valid
+
     vp = 1_000_000.0 / dt_usm
     logs = grid.LogSet(
         {
@@ -407,10 +476,14 @@ def load_standard_vp_rho_logs(path: str | Path) -> StandardVpRhoLogs:
             "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=True),
         }
     )
-    return StandardVpRhoLogs(logs=logs, observed_mask=dt_valid & rho_valid)
+    return StandardVpRhoLogs(logs=logs, observed_mask=observed_mask)
 
 
-def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
+def load_vp_rho_logset_from_standard_las(
+    path: str | Path,
+    *,
+    require_observation_mask: bool = False,
+) -> grid.LogSet:
     """从标准 LAS 构建 MD 域 Vp/Rho LogSet。
 
     标准 LAS 指包含第三步标准曲线 ``DT_USM`` 与 ``RHO_GCC`` 的 LAS，
@@ -431,7 +504,7 @@ def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
     ValueError
         缺少必需曲线、采样轴不一致或单位错误时。
     """
-    return load_standard_vp_rho_logs(path).logs
+    return load_standard_vp_rho_logs(path, require_observation_mask=require_observation_mask).logs
 
 
 def _header_value(las: lasio.LASFile, section: str, mnemonic: str) -> Any:

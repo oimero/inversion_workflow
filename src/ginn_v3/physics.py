@@ -8,7 +8,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from cup.physics.torch_backend import forward_at_interfaces, relative_twt_from_depth
+from cup.physics.support import complete_response_mask, relative_twt_with_gaps
+from cup.physics.torch_backend import forward_at_interfaces
 from cup.seismic.geometry import SampleAxis
 from cup.utils.masks import true_runs
 from ginn_v3.types import ForwardResult, ObservationBatch
@@ -61,8 +62,22 @@ class AcousticPhysics:
                 raise ValueError("GINN v3 first-version velocity is fixed during training.")
             if bool((support & (~torch.isfinite(velocity) | (velocity <= 0.0))).any().item()):
                 raise ValueError("Supported depth velocity must be finite and positive.")
+        support_numpy = support.detach().cpu().numpy().astype(bool, copy=False)
+        if self.sample_axis.domain == "time":
+            sample_times_numpy = np.broadcast_to(
+                np.asarray(self.sample_axis.values, dtype=np.float64),
+                support_numpy.shape,
+            ).copy()
+        else:
+            velocity_numpy = velocity.detach().cpu().numpy().astype(np.float64, copy=False)
+            sample_times_numpy = relative_twt_with_gaps(
+                velocity_numpy,
+                np.asarray(self.sample_axis.values, dtype=np.float64),
+                support_numpy,
+            )
+
         grouped: dict[tuple[int, int], list[int]] = defaultdict(list)
-        for row, mask in enumerate(support.detach().cpu().numpy()):
+        for row, mask in enumerate(support_numpy):
             for start, stop in true_runs(mask):
                 if stop - start >= 2:
                     grouped[(int(start), int(stop))].append(row)
@@ -72,23 +87,11 @@ class AcousticPhysics:
         for (start, stop), rows in grouped.items():
             selected = torch.as_tensor(rows, device=log_ai.device, dtype=torch.long)
             values = log_ai[selected, start:stop]
-            if self.sample_axis.domain == "time":
-                sample_times = torch.as_tensor(
-                    self.sample_axis.values[start:stop].copy(),
-                    device=log_ai.device,
-                    dtype=torch.float64,
-                )
-                sample_times = sample_times - sample_times[0]
-            else:
-                coordinates = torch.as_tensor(
-                    self.sample_axis.values[start:stop].copy(),
-                    device=log_ai.device,
-                    dtype=torch.float64,
-                )
-                sample_times, _ = relative_twt_from_depth(
-                    velocity[selected, start:stop],
-                    coordinates,
-                )
+            sample_times = torch.as_tensor(
+                sample_times_numpy[np.asarray(rows, dtype=np.int64), start:stop],
+                device=log_ai.device,
+                dtype=torch.float64,
+            )
             synthetic = forward_at_interfaces(
                 values,
                 sample_times,
@@ -99,5 +102,13 @@ class AcousticPhysics:
             valid[selected, start:stop] = True
         if not bool(valid.any().item()):
             raise ValueError("Acoustic forward has no continuous supported run of at least two samples.")
+        complete = complete_response_mask(
+            sample_times_numpy,
+            support_numpy,
+            self.wavelet_time_s,
+        )
+        valid &= torch.as_tensor(complete, device=valid.device, dtype=torch.bool)
+        if not bool(valid.any().item()):
+            raise ValueError("Acoustic forward has no complete supported response after internal-gap erosion.")
         return ForwardResult(output, valid)
 

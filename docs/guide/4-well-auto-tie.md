@@ -118,8 +118,6 @@ well_auto_tie:
 
 `well_usage` 是工作流级井角色配置，放在脚本配置段之外。`trusted_well_names` 中的井参与第四步标定；`background_only_well_names` 中的井跳过第四步，后续由第六步直接读取第三步曲线，为低频背景提供信息。未填写可信井名单时，除背景井外的井都具有标定资格；填写后，只有名单中的井具有标定资格。两份名单不能重叠。
 
-这一层只决定井是否进入第四步。曲线可用性、井位和时深覆盖范围仍由第四步自己的准入检查决定。
-
 ### `target_interval`
 
 定义每口井要标定的时间范围。脚本先读取顶底解释层位的双程旅行时，再在上下各加入一段冗余时间，形成实际标定窗口。冗余过小时，目标层边界附近的波形可能被截断；冗余过大时，目标层外的强反射会进入标定窗口。
@@ -145,7 +143,7 @@ anchor_shift_s = horizon_twt_at_this_well_anchor_xy - interp(petrel_tdt, anchor_
 shifted_tdt.twt = petrel_tdt.twt + anchor_shift_s + manual_shift_s
 ```
 
-锚点深度必须落在该井时深表覆盖范围内。超出范围时脚本会直接失败，避免用端点外推制造看似合理但不可追溯的时移。
+锚点深度必须落在该井时深表覆盖范围内。超出范围时脚本直接失败。
 
 对没有 Petrel TDT 的直井，脚本会用锚点给声波积分定时，再沿声波曲线向上、向下建立初始 TDT；人工整体时移会叠加在这条新建 TDT 上。
 
@@ -204,7 +202,7 @@ manual_shift:
 |------|------|
 | `allow_near_outside` | 是否允许工区边缘外的井参与标定。默认只接受工区内井。 |
 | `min_tie_samples` | 实际标定窗口里至少要保留多少时间样点。 |
-| `max_short_log_gap_s` | 按当前井的双程旅行时判断内部 DT/RHO 短缺口是否可修复，默认 `0.010 s`。修复结果写入第四步滤波 LAS；超过阈值的长缺口继续保留为空值。 |
+| `max_short_log_gap_s` | 按当前井的双程旅行时判断内部 DT/RHO 短缺口是否可修复，默认 `0.010 s`。 |
 | `max_trajectory_outside_fraction` | 斜井目标窗口内最多允许多少比例的轨迹样点落到工区外。 |
 
 短缺口的时长按当前井的时深关系换算为双程旅行时。内部 DT/RHO 联合有效性断开的区段若不超过阈值，第四步用两侧有限样点线性插值修复，再参与滤波和正演；端点缺失、无法建立时长的缺口以及超过阈值的长缺口保持无效。导出的滤波 LAS 保存修复后的曲线，并增加 `AI_OBSERVED`：原始 DT/RHO 同时有效的样点为 1，短缺口修复样点为 0。这样后续步骤可以使用连续数值，同时仍能区分原始观测与修复值。
@@ -267,20 +265,20 @@ manual_shift:
 | `well_tie_metrics.csv` | 已执行井的标定指标、粗校正总时移和输出路径 |
 | `rejected_wells.csv` | 路由阶段被拒绝的井及原因 |
 | `tie_window_report.csv` | 目标窗口、实际窗口、TDT 来源、粗校正量和裁剪原因 |
-| `anchor_report.csv` | 时间域锚点路线的锚点 MD/TWT、层位采样信息和锚点作用 |
+| `anchor_report.csv` | 锚点路线的锚点 MD/TWT、层位采样信息和锚点作用 |
 | `wavelet_inventory.csv` | 成功井导出的候选子波清单，供第五步使用 |
 | `wavelets/wavelet_201ms_<well>.csv` | 裁剪并能量归一化后的子波 |
 | `time_depth/initial_tdt_<well>.csv` | 进入 `wtie` 前的初始 TDT，含 `source` 列 |
 | `time_depth/source_tdt_<well>.csv` | 粗校正后、裁剪标定窗口前的完整源时深表；后续结合最佳整体时移对齐可用井曲线 |
 | `time_depth/optimized_tdt_<well>.csv` | `wtie` 优化后的 TDT |
-| `petrel_checkshots/optimized_tdt_<well>.txt` | 时间域细标定后的 Petrel checkshots 文件 |
+| `petrel_checkshots/optimized_tdt_<well>.txt` | 细标定后的 Petrel checkshots 文件 |
 | `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS；短缺口已修复，长缺口仍为空值，并用 `AI_OBSERVED` 标记原始观测支撑，供第五步和后续步骤使用 |
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
-| `trace_sample_plan/trace_sample_plan_<well>.csv` | 时间域斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
-| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 时间域斜井细标定后按优化 TDT 生成的样点级落道明细；直井通常没有 |
+| `trace_sample_plan/trace_sample_plan_<well>.csv` | 斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
+| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后按优化 TDT 生成的样点级落道明细；直井通常没有 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
-| `run_summary.json` | `well_auto_tie_v5` 输入契约、路由统计、失败统计、短缺口阈值和逐井补充信息 |
+| `run_summary.json` | 输入契约、路由统计、失败统计、短缺口阈值和逐井补充信息 |
 
 ---
 

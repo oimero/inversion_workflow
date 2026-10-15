@@ -26,13 +26,13 @@
     - 匹配顺序是精确 mnemonic 优先，再用 LASIO 的 `:1` / `:2` 后缀规范化兜底；兜底命中多条时必须显式指定精确名。
 - 标准预处理 LAS 读取入口：`cup.well.las.load_vp_rho_logset_from_standard_las(path)`。
     - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
-    - 入口只读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`；不会静默插值缺失值，即使 LAS 含 `AI`，也不会读取或校验旧 AI。
-    - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`；第四步产物还读取 `AI_OBSERVED`，其中 1 表示原始 DT/RHO 同时有效，0 表示短缺口修复值。
-    - 短缺口时长按当前井的时深关系换算为双程旅行时；短缺口修复由 `cup.well.gaps` 统一执行，第四步标定窗口仍由 `cup.well.tie` 组织。
+    - 入口读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`。
+    - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`；第四步输出用 `AI_OBSERVED` 保留原始 DT/RHO 共同观测支撑。
+    - 短缺口按本井时深关系换算为双程旅行时并修复，长缺口保持无效；波形计算分段处理，并排除内部长缺口边缘受截断影响的样点。
 - 时间域第三、四步成功导出的 LAS 固定含 `AI`：
     - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
-    - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI；短缺口已按第四步阈值修复，长缺口仍为空值。
-    - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。第四步 LAS 的 `AI_OBSERVED` 保留原始 DT/RHO 共同观测支撑。
+    - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，短缺口已修复，长缺口保持为空值。
+    - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
 
 ## 时深表
 
@@ -65,8 +65,7 @@
     - `cup.seismic.survey.import_seismic()` 读取完整的 3D 数组；井震标定和井位采样通过 `SurveyContext` 获取带几何信息的井旁道。
 - 工区几何入口：`survey.line_geometry`，类型为 `cup.seismic.geometry.SurveyLineGeometry`。
 - `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，不是 XY 米制间距。物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已构建的 XY 网格计算。
-- 最近道吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。
-    - 它用于 `nearest_inline`、`nearest_xline`、同道冲突检查、轨迹点落道报告。
+- 最近道吸附使用 `line_min + round((line_float - line_min) / line_step) * line_step`，按实际线号步长计算。
 - 井旁道双线性插值公式：先由 `SurveyLineGeometry.coord_to_index(x, y)` 得到浮点 index `(i, j)`，令 `wi = i - floor(i)`、`wj = j - floor(j)`，则：
 
 ```text
@@ -104,7 +103,7 @@ trace =
 | inline / xline | 线号（整数或浮点） | 地震工区网格坐标，非 XY 米制 |
 | X / Y | m | 工区投影平面坐标 |
 | `flat_idx` | 整数 | 地震体内部一维道编号，依赖当前几何 |
-| `seismic_sample_index` | 整数 | 地震体全局采样轴上的派生索引，依赖当前采样轴；体采样仍以 TWT/TVDSS 等规范坐标重新计算并交叉校验 |
+| `seismic_sample_index` | 整数 | 地震体全局采样轴上的派生索引，依赖当前采样轴 |
 | `trajectory_point_index` | 整数 | 原始井轨迹点在轨迹文件内的局部序号 |
 | `trajectory_sample_index` | 整数 | 井轨迹在传入 TWT 轴上重采样后的局部序号 |
 | `trace_plan_index` | 整数 | 当前 trace plan 内的局部行号，裁剪后重新从 0 编号 |

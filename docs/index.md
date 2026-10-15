@@ -24,5 +24,4 @@ flowchart TB
 
 ## 深度域工作流
 
-深度域工作流复用全部步骤的统一入口。步骤根据 `seismic.domain` 读取时间轴或深度轴，并在需要时使用本井速度建立局部时深关系。深度轴、局部时深转换和深度域正演输入的细节见
-[深度域工作流](guide/depth-domain-workflow.md)。
+各步骤共用同一入口，深度域的坐标、单位与正演配置见[深度域工作流](guide/depth-domain-workflow.md)。

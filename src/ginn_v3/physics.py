@@ -16,10 +16,17 @@ from ginn_v3.types import ForwardResult, ObservationBatch
 
 
 class AcousticPhysics:
-    """Shared time/depth interface; only impedance and wavelet carry gradients."""
+    """Time/depth acoustics on calculation support, with measured edge supervision.
 
-    def __init__(self, sample_axis: SampleAxis, wavelet_time_s: np.ndarray | Tensor):
+    An explicit ``support_mask`` supplies the available measured curve. Its
+    outer finite-run edges remain usable. Extended predicted curves can
+    require a complete outer response; internal-gap masking applies to both.
+    """
+
+    def __init__(self, sample_axis: SampleAxis, wavelet_time_s: np.ndarray | Tensor,
+                 *, complete_outer_response: bool = False):
         self.sample_axis = sample_axis
+        self.complete_outer_response = bool(complete_outer_response)
         if isinstance(wavelet_time_s, Tensor):
             times = wavelet_time_s.detach().cpu().numpy().astype(np.float64)
         else:
@@ -108,7 +115,19 @@ class AcousticPhysics:
             self.wavelet_time_s,
         )
         valid &= torch.as_tensor(complete, device=valid.device, dtype=torch.bool)
+        # Extended predicted curves provide calculation context outside the
+        # output interval. Measured curves retain finite-run edge supervision.
+        if self.complete_outer_response and support_mask is None:
+            outer_complete = np.zeros_like(support_numpy)
+            for row, mask in enumerate(support_numpy):
+                for start, stop in true_runs(mask):
+                    times_run = sample_times_numpy[row, start:stop]
+                    outer_complete[row, start:stop] = (
+                        (times_run >= times_run[0] - self.wavelet_time_s[0])
+                        & (times_run <= times_run[-1] - self.wavelet_time_s[-1])
+                    )
+            valid &= torch.as_tensor(outer_complete, device=valid.device, dtype=torch.bool)
         if not bool(valid.any().item()):
-            raise ValueError("Acoustic forward has no complete supported response after internal-gap erosion.")
+            raise ValueError("Acoustic forward has no usable supported response after masking.")
         return ForwardResult(output, valid)
 

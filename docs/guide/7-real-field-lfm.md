@@ -44,6 +44,13 @@ real_field_lfm:
   source_runs:
     well_control_run_dir:                        # 留空自动发现最新第六步
 
+  context_extension:
+    enabled: true
+    baseline_id: proportional_slice_main
+    top_axis_units: 0.12
+    bottom_axis_units: 0.12
+    transition_axis_units: 0.06
+
   output_geometry:
     mode: volume                                 # 全工区规则体
 
@@ -101,7 +108,25 @@ target_interval:
 
 ### `source_runs`
 
-指向第六步产出的井控集运行目录。留空时自动发现最近一次 `real_field_well_controls_*` 运行。加载时检查数据模式、采样域和单位、采样轴、坐标及数组形状，并确认井控记录的目标地震体与当前配置一致。
+指向第六步产出的井控集运行目录。留空时自动发现最近一次 `real_field_well_controls_*` 运行。加载时检查数据模式、采样域和单位、采样轴、坐标及数组形状，并确认井控记录的目标地震体与当前配置一致。时间域井控中的层外长曲线由第四步的完整 `source_tdt_file` 和最佳常量平移恢复，再供本步连续有效段建模。
+
+### `context_extension`
+
+可选的上下文扩展为第八步提供目的层上下的低频背景。扩展长度使用当前地震的纵向采样轴单位：时间域为秒，深度域为米。`top_axis_units` 和 `bottom_axis_units` 可以不同，也可以将其中一侧设为 `0`；`transition_axis_units` 控制原目的层模型与外侧背景之间的平滑衔接长度。
+
+```yaml
+real_field_lfm:
+  context_extension:
+    enabled: true
+    baseline_id: proportional_slice_main
+    top_axis_units: 0.12
+    bottom_axis_units: 0.12
+    transition_axis_units: 0.06
+```
+
+`baseline_id` 必须引用同一 `baselines` 段中已定义的基线。脚本按各变体的基线构建目的层模型，再用此处选定的基线方法构建上下外部背景。目的层内部的模型值保持原样，衔接偏移在外侧过渡带内平滑衰减。`enabled: false` 或省略该段时，不生成扩展上下文。
+
+上下文扩展不改变第六步固定的评价区间，也不改变目标层模型的空间网格。扩展背景供第八步建立输入特征和正演支撑；目标层模型仍作为第八步预测波形损失、低频归一化参考和体输出的范围。
 
 ### `output_geometry`
 
@@ -315,6 +340,7 @@ comparisons:
 
 1. 加载目标层位并统一时间单位，建立层位面、采样轴和层间时间间隔约束。
 2. 按输出模式确定网格：全工区模式使用源地震的完整轴，矩形窗口模式使用指定的轴范围，二维剖面模式沿折线路径生成等距道位置。
+3. 如果启用了上下文扩展，按选定基线拟合目标层外的背景，在两侧按配置长度生成上下文，并在边界处平滑衔接。
 
 ### 第三阶段：构建基线模型
 
@@ -347,8 +373,9 @@ comparisons:
 1. 为每个变体写出主模型、方法字段、修饰字段、质控表和图件。
 2. 为每个比较关系写出总体差异、井旁差异和对比图。
 3. 写出变体清单和运行摘要。
-4. 全工区模式额外导出线性 AI 的 SEG-Y 或 ZGY 体。
-5. 全部成功后将临时目录改名为正式输出目录。
+4. 启用上下文扩展时，为每个变体写出扩展背景文件。
+5. 全工区模式额外导出线性 AI 的 SEG-Y 或 ZGY 体。
+6. 全部成功后将临时目录改名为正式输出目录。
 
 ---
 
@@ -368,6 +395,7 @@ real_field_lfm_<run_timestamp>/
     └── <variant_id>/
         ├── <variant_id>_linear_ai.<segy_or_zgy>  # 仅 volume 模式
         ├── lfm.npz
+        ├── context.npz                 # 启用 context_extension 时
         ├── method_fields.npz
         ├── modifier_fields.npz        # 仅含 modifier 时
         ├── variant_summary.json
@@ -394,7 +422,7 @@ real_field_lfm_<run_timestamp>/
 
 ### `variants/<variant_id>/lfm.npz`
 
-主低频模型体，跨方法同构。只包含：
+主低频模型体，表示目标层范围内的模型，跨方法同构。第八步使用它定义预测波形损失、低频归一化参考和体输出范围。只包含：
 
 | 键 | dtype | 含义 |
 |------|------|------|
@@ -404,6 +432,10 @@ real_field_lfm_<run_timestamp>/
 | `metadata_json` | 标量字符串 | 完整 variant metadata |
 
 a/b、kriging variance、framework probability 等方法专属字段只在 sidecar NPZ 中。
+
+### `variants/<variant_id>/context.npz`
+
+启用 `context_extension` 时写出扩展背景。它与 `lfm.npz` 共用同一平面网格和完整纵向采样轴，通过扩大有效样点范围提供上下文，扩展范围受地震采样轴边界限制。目标层内部复制原模型值，外侧背景来自选定基线并平滑衔接。第八步使用扩展背景建立网络输入和正演支撑；预测波形损失、低频归一化参考和体输出仍使用目的层范围。
 
 ### `variants/<variant_id>/variant_summary.json`
 

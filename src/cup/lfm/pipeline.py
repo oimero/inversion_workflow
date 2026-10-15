@@ -19,6 +19,7 @@ import pandas as pd
 from cup.config.workflow import WorkflowConfig
 from cup.lfm.builders import BUILDERS
 from cup.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
+from cup.lfm.context import attach_context, build_context_field, resolve_context_extension
 from cup.lfm.framework import MODIFIERS
 from cup.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
 from cup.seismic.target_zone_io import build_workflow_target_zone
@@ -143,9 +144,24 @@ def _variant_graph(
     *,
     validate_methods: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    allowed_top = {"source_runs", "output_geometry", "baselines", "modifiers", "variants", "comparisons"}
-    if set(config) != allowed_top:
-        raise ValueError(f"real_field_lfm must contain exactly {sorted(allowed_top)}.")
+    required_top = {
+        "source_runs",
+        "output_geometry",
+        "baselines",
+        "modifiers",
+        "variants",
+        "comparisons",
+    }
+    allowed_top = {
+        *required_top,
+        "context_extension",
+    }
+    unknown_top = set(config) - allowed_top
+    if unknown_top:
+        raise ValueError(f"real_field_lfm contains unknown fields: {sorted(unknown_top)}.")
+    missing_top = required_top - set(config)
+    if missing_top:
+        raise ValueError(f"real_field_lfm is missing required fields: {sorted(missing_top)}.")
     baselines_raw = config.get("baselines")
     modifiers_raw = config.get("modifiers")
     variants_raw = config.get("variants")
@@ -274,10 +290,31 @@ def _framework_well_effect_qc(
     return pd.DataFrame.from_records(rows)
 
 
+def _apply_context_extension(
+    *,
+    results: Mapping[str, LfmVariantResult],
+    config: Mapping[str, Any],
+    controls: WellControlSet,
+    context: LfmContext,
+) -> dict[str, LfmVariantResult]:
+    settings, generated_context = build_context_field(
+        config=config,
+        controls=controls,
+        context=context,
+    )
+    if settings is None or generated_context is None:
+        return dict(results)
+    return {
+        variant_id: attach_context(result, generated_context, settings, context=context)
+        for variant_id, result in results.items()
+    }
+
+
 def build_lfm_variants(
     *, config: Mapping[str, Any], controls: WellControlSet, context: LfmContext, repo_root: Path
 ) -> tuple[dict[str, LfmVariantResult], list[dict[str, Any]]]:
     baselines, modifiers, variants, comparisons = _variant_graph(config)
+    resolve_context_extension(config, baselines=baselines, sample_axis=context.sample_axis)
     required_baselines = {item["baseline_id"] for item in variants}
     baseline_results: dict[str, LfmVariantResult] = {}
     for baseline_id in required_baselines:
@@ -336,6 +373,12 @@ def build_lfm_variants(
     for variant_id, result in results.items():
         if not np.array_equal(result.valid_mask_model, first.valid_mask_model):
             raise ValueError(f"Variant {variant_id!r} valid_mask_model differs from the run-wide authoritative mask.")
+    results = _apply_context_extension(
+        results=results,
+        config=config,
+        controls=controls,
+        context=context,
+    )
     return results, comparisons
 
 
@@ -351,6 +394,7 @@ def _validate_prepared_results(
         config,
         validate_methods=False,
     )
+    resolve_context_extension(config, baselines=baselines, sample_axis=context.sample_axis)
     if comparisons:
         raise ValueError("Prebuilt LFM publication does not support comparisons.")
     if not isinstance(prepared_results, Mapping):
@@ -552,6 +596,13 @@ def _write_variant(
     modifier_path = directory / "modifier_fields.npz"
     if result.modifier_fields:
         _save_array_sidecar(modifier_path, result.modifier_fields)
+    context_path = directory / "context.npz"
+    if result.context_log_ai is not None and result.context_valid_mask is not None:
+        np.savez_compressed(
+            context_path,
+            log_ai=np.asarray(result.context_log_ai, dtype=np.float32),
+            valid_mask_model=np.asarray(result.context_valid_mask, dtype=bool),
+        )
     qc_outputs: dict[str, dict[str, str]] = {}
     for name, frame in result.qc_tables.items():
         path = qc_dir / f"{name}.csv"
@@ -600,6 +651,17 @@ def _write_variant(
         "modifier_sidecar_path": modifier_sidecar_path,
         "method_metadata": {key: value for key, value in result.metadata.items() if not key.startswith("resolved_")},
     }
+    context_metadata = dict(result.metadata.get("context_extension") or {})
+    if result.context_log_ai is not None and result.context_valid_mask is not None:
+        context_metadata["enabled"] = True
+        context_metadata["sample_domain"] = context.sample_axis.domain
+        context_metadata["sample_unit"] = context.sample_axis.unit
+        context_metadata["context_path"] = repo_relative_path(
+            final_directory / context_path.name, root=repo_root
+        )
+    else:
+        context_metadata = {"enabled": False}
+    metadata["context_extension"] = context_metadata
     lfm_path = directory / "lfm.npz"
     np.savez_compressed(
         lfm_path,
@@ -651,6 +713,9 @@ def _write_variant(
         },
         "outputs": {
             "lfm": {"path": repo_relative_path(final_directory / lfm_path.name, root=repo_root)},
+            "context": None
+            if result.context_log_ai is None or result.context_valid_mask is None
+            else {"path": repo_relative_path(final_directory / context_path.name, root=repo_root)},
             "method_fields": {"path": method_sidecar_path},
             "modifier_fields": None if modifier_sidecar_path is None else {"path": modifier_sidecar_path},
             "qc": qc_outputs,
@@ -903,6 +968,12 @@ def run_lfm_pipeline(
             results, comparisons = _validate_prepared_results(
                 config=config,
                 prepared_results=prepared_results,
+                context=context,
+            )
+            results = _apply_context_extension(
+                results=results,
+                config=config,
+                controls=controls,
                 context=context,
             )
         rows = [

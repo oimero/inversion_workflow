@@ -238,6 +238,7 @@ manual_shift:
 
 1. **建立初始关系。** 有时深表时读取 Petrel 时深表；无时深表时使用井分层深度与解释层位时间建立锚点，再沿声波曲线积分，得到测深到双程旅行时的关系。
 2. **应用粗校正。** 按配置把锚点校正和人工平移作用于整条时深关系；时深表只覆盖目标窗的一部分时，沿声波曲线向端点外延伸。
+   保存粗校正后的完整源时深关系，供后续恢复可用的层外井曲线；标定计算使用目的层窗口内的关系。
 3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，按双程旅行时阈值修复内部短缺口；长缺口保持无效，并在目标窗口内选择最长的联合有效段，检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
 
 ### 第三步：采样地震道
@@ -268,6 +269,7 @@ manual_shift:
 | `wavelet_inventory.csv` | 成功井导出的候选子波清单，供第五步使用 |
 | `wavelets/wavelet_201ms_<well>.csv` | 裁剪并能量归一化后的子波 |
 | `time_depth/initial_tdt_<well>.csv` | 进入 `wtie` 前的初始 TDT，含 `source` 列 |
+| `time_depth/source_tdt_<well>.csv` | 粗校正后、裁剪标定窗口前的完整源时深表；后续结合最佳整体时移对齐可用井曲线 |
 | `time_depth/optimized_tdt_<well>.csv` | `wtie` 优化后的 TDT |
 | `petrel_checkshots/optimized_tdt_<well>.txt` | 时间域细标定后的 Petrel checkshots 文件 |
 | `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS；短缺口已修复，长缺口仍为空值，并用 `AI_OBSERVED` 标记原始观测支撑，供第五步和后续步骤使用 |

@@ -243,6 +243,7 @@ def output_paths(output_dir: Path, well_name: str, *, sample_domain: str) -> dic
     paths = {
         "wavelet": output_dir / "wavelets" / f"wavelet_201ms_{safe}.csv",
         "initial_tdt": output_dir / "time_depth" / f"initial_tdt_{safe}.csv",
+        "source_tdt": output_dir / "time_depth" / f"source_tdt_{safe}.csv",
         "optimized_tdt": output_dir / "time_depth" / f"optimized_tdt_{safe}.csv",
         "petrel_checkshot": output_dir / "petrel_checkshots" / f"optimized_tdt_{safe}.txt",
         "filtered_las": output_dir / "filtered_las" / f"filtered_logs_{safe}.las",
@@ -845,6 +846,12 @@ def prepare_time_route(
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
         seismic_sample_interval_s=float(survey.sample_axis("time").step),
     )
+    # Keep the complete, coarse-corrected source mapping as a Step-4
+    # artifact.  The optimizer uses a cropped window below, while Step 6
+    # needs this full mapping plus the optimized constant shift to recover
+    # source LAS samples outside the tie window without extrapolation.
+    paths = output_paths(output_dir, plan.well_name, sample_domain="time")
+    write_time_depth_table_csv(table, paths["source_tdt"])
     target = replace(target, start_s=continuous.start_twt_s, end_s=continuous.end_twt_s)
     if plan.route in {"vertical_anchor_from_tops", "deviated_anchor_from_tops"}:
         prepared = prepare_anchor_tdt_for_window(
@@ -869,6 +876,7 @@ def prepare_time_route(
         "time_depth_file": repo_relative_path(resolve_repo_path(plan.time_depth_file, repo_root=repo_root), root=repo_root) if plan.time_depth_file else "",
         "coarse_correction": coarse,
         "anchor": anchor,
+        "source_tdt_file": repo_relative_path(paths["source_tdt"], root=repo_root),
     }
     seismic_override = None
     if trajectory is not None and plan.route == "deviated_with_tdt":
@@ -1649,6 +1657,7 @@ def execute_well(
         optimized_corr=optimized_corr,
         optimized_nmae=optimized_nmae,
         best_table_shift_ms=best_shift_ms,
+        source_tdt_file=str((extra_seed or {}).get("source_tdt_file") or ""),
         wavelet_file=repo_relative_path(paths["wavelet"], root=repo_root),
         optimized_tdt_file=repo_relative_path(paths["optimized_tdt"], root=repo_root),
         qc_figure_dir=repo_relative_path(paths["figure_dir"], root=repo_root),

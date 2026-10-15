@@ -184,7 +184,8 @@ class JointTrainer:
         if synthetic.shape != batch.observed_seismic.shape:
             raise ValueError(f"{name} physics output shape differs from observations.")
         valid = valid.to(device=synthetic.device, dtype=torch.bool)
-        mask = batch.observed_mask.to(device=synthetic.device, dtype=torch.bool) & valid
+        mask = (batch.observed_mask.to(device=synthetic.device, dtype=torch.bool)
+                & batch.output_mask.to(device=synthetic.device, dtype=torch.bool) & valid)
         return _masked_mse(
             synthetic,
             self._standardized_observed(batch).to(device=synthetic.device, dtype=synthetic.dtype),
@@ -334,7 +335,8 @@ class JointTrainer:
                     support_mask=None,
                 )
                 synthetic, valid = _forward_result(forward)
-                mask = batch.observed_mask.to(synthetic.device) & valid.to(synthetic.device, dtype=torch.bool)
+                mask = (batch.observed_mask.to(synthetic.device) & batch.output_mask.to(synthetic.device)
+                        & valid.to(synthetic.device, dtype=torch.bool))
                 target = self._standardized_observed(batch).to(synthetic.device, synthetic.dtype)
                 selected = (synthetic - target)[mask]
                 if selected.numel() == 0:
@@ -355,7 +357,8 @@ class JointTrainer:
                     well.observations.features,
                     well.observations.initial_log_ai,
                 )
-                mask = well.target_mask.to(prediction.log_ai.device, dtype=torch.bool)
+                mask = (well.target_mask.to(prediction.log_ai.device, dtype=torch.bool)
+                        & well.observations.output_mask.to(prediction.log_ai.device))
                 if not bool(mask.any().item()):
                     raise ValueError("training well validation metric has no valid target samples.")
                 # Apply the support mask before exponentiating, for the same

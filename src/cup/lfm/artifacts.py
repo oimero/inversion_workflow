@@ -29,6 +29,7 @@ class ResolvedLfmVariant:
     variant_metadata: Mapping[str, Any]
     well_control_run_dir: Path
     well_control_contract_fingerprint_sha256: str
+    context_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,28 @@ class LfmInput:
     baseline_method: str
     lowpass_value: float
     lowpass_unit: str
+    context_log_ai: np.ndarray | None = None
+    context_valid_mask: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if (self.context_log_ai is None) != (self.context_valid_mask is None):
+            raise ValueError("LfmInput context_log_ai and context_valid_mask must be provided together.")
+
+    @property
+    def calculation_log_ai(self) -> np.ndarray:
+        """Return the primary LFM together with optional outer calculation context."""
+
+        if self.context_log_ai is None:
+            return self.log_ai
+        return self.context_log_ai
+
+    @property
+    def calculation_mask(self) -> np.ndarray:
+        """Return the support used by calculation operators."""
+
+        if self.context_log_ai is None:
+            return self.valid_mask
+        return self.context_valid_mask
 
 
 def _required_text(config: Mapping[str, Any], key: str) -> str:
@@ -239,6 +262,25 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         != controls_summary_path.resolve()
     ):
         raise ValueError("Selected LFM variant points to a different WellControlSet path.")
+    context_config = metadata.get("context_extension")
+    if context_config is None:
+        context_path = None
+    elif isinstance(context_config, Mapping):
+        enabled = context_config.get("enabled")
+        if enabled is not True:
+            if enabled is not False:
+                raise ValueError("Selected LFM context_extension.enabled must be a boolean.")
+            context_path = None
+        else:
+            context_text = str(context_config.get("context_path") or "").strip()
+            if not context_text:
+                raise ValueError("Enabled LFM context_extension must record context_path.")
+            context_path = resolve_relative_path(context_text, root=repo_root)
+            if not context_path.is_file():
+                raise FileNotFoundError(context_path)
+    else:
+        raise ValueError("Selected LFM context_extension metadata must be a mapping.")
+
     return ResolvedLfmVariant(
         run_dir=run_dir,
         variant_id=variant_id,
@@ -248,6 +290,7 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         run_summary_path=run_summary_path,
         run_summary=summary,
         variant_metadata=metadata,
+        context_path=context_path,
         well_control_run_dir=well_control_run,
         well_control_contract_fingerprint_sha256=controls_fingerprint,
     )
@@ -262,6 +305,26 @@ def load_lfm_input(inputs: Mapping[str, Any], *, repo_root: Path) -> LfmInput:
         samples = np.asarray(data["samples"], dtype=np.float64)
         ilines = np.asarray(data["ilines"], dtype=np.float64)
         xlines = np.asarray(data["xlines"], dtype=np.float64)
+    context_log_ai: np.ndarray | None = None
+    context_valid_mask: np.ndarray | None = None
+    if variant.context_path is not None:
+        with np.load(variant.context_path, allow_pickle=False) as data:
+            if set(data.files) != {"log_ai", "valid_mask_model"}:
+                raise ValueError("Selected LFM context.npz must contain exactly log_ai/valid_mask_model.")
+            if data["log_ai"].dtype != np.dtype("float32") or data["valid_mask_model"].dtype != np.dtype("bool"):
+                raise ValueError("Selected LFM context arrays must have float32/bool dtypes.")
+            context_log_ai = np.asarray(data["log_ai"], dtype=np.float32)
+            context_valid_mask = np.asarray(data["valid_mask_model"], dtype=bool)
+        if context_log_ai.shape != log_ai.shape or context_valid_mask.shape != valid_mask.shape:
+            raise ValueError("Selected LFM context arrays do not match primary LFM shape.")
+        if np.any(valid_mask & ~context_valid_mask):
+            raise ValueError("Selected LFM context support must contain primary LFM support.")
+        if np.any(~np.isfinite(context_log_ai[context_valid_mask])) or np.any(
+            np.isfinite(context_log_ai[~context_valid_mask])
+        ):
+            raise ValueError("Selected LFM context violates finite-inside/NaN-outside mask semantics.")
+        if not np.array_equal(context_log_ai[valid_mask], log_ai[valid_mask]):
+            raise ValueError("Selected LFM context values must equal primary log_ai on primary support.")
     metadata = dict(variant.variant_metadata)
     domain = str(metadata["sample_domain"])
     axis = SampleAxis(
@@ -287,6 +350,8 @@ def load_lfm_input(inputs: Mapping[str, Any], *, repo_root: Path) -> LfmInput:
         variant=variant,
         log_ai=log_ai,
         valid_mask=valid_mask,
+        context_log_ai=context_log_ai,
+        context_valid_mask=context_valid_mask,
         sample_axis=axis,
         ilines=ilines,
         xlines=xlines,

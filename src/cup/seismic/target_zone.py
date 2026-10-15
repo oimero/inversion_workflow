@@ -787,8 +787,10 @@ class TargetZone:
 
     def with_boundary_extension(
         self,
-        extension_samples: int,
+        extension_samples: int = 0,
         *,
+        top_extension_samples: int | None = None,
+        bottom_extension_samples: int | None = None,
         top_extension_name: str = "top_extension",
         bottom_extension_name: str = "bottom_extension",
     ) -> "TargetZone":
@@ -797,7 +799,11 @@ class TargetZone:
         Parameters
         ----------
         extension_samples : int
-            外延样点数。
+            当未单独指定上下侧样点数时，两侧使用的外延样点数。
+        top_extension_samples : int or None, optional
+            顶侧外延样点数。提供后覆盖 ``extension_samples``。
+        bottom_extension_samples : int or None, optional
+            底侧外延样点数。提供后覆盖 ``extension_samples``。
         top_extension_name : str, default="top_extension"
             顶外延层位名称。
         bottom_extension_name : str, default="bottom_extension"
@@ -813,36 +819,74 @@ class TargetZone:
         ValueError
             当参数非法或层位名称冲突时。
         """
-        if extension_samples < 0:
-            raise ValueError(f"extension_samples must be >= 0, got {extension_samples}.")
-        if extension_samples == 0:
+        def _count(value: int, *, name: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
+            if int(value) < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}.")
+            return int(value)
+
+        common_count = _count(extension_samples, name="extension_samples")
+        top_count = common_count if top_extension_samples is None else _count(
+            top_extension_samples, name="top_extension_samples"
+        )
+        bottom_count = common_count if bottom_extension_samples is None else _count(
+            bottom_extension_samples, name="bottom_extension_samples"
+        )
+        if top_count == 0 and bottom_count == 0:
             return self
-        if top_extension_name == bottom_extension_name:
+        active_names = [
+            name
+            for count, name in ((top_count, top_extension_name), (bottom_count, bottom_extension_name))
+            if count > 0
+        ]
+        if len(active_names) == 2 and active_names[0] == active_names[1]:
             raise ValueError("top_extension_name and bottom_extension_name must be different.")
-        duplicate_names = {name for name in (top_extension_name, bottom_extension_name) if name in self.horizon_names}
+        duplicate_names = {name for name in active_names if name in self.horizon_names}
         if duplicate_names:
             raise ValueError(f"extension horizon names already exist: {sorted(duplicate_names)}")
 
         sample_min = float(self._sample_axis[0])
         sample_max = float(self._sample_axis[-1])
-        offset = float(extension_samples) * float(self.geometry["sample_step"])
 
         top_source = self._horizon_grids[self.horizon_names[0]]
         bottom_source = self._horizon_grids[self.horizon_names[-1]]
-        top_extension = np.where(np.isfinite(top_source), np.clip(top_source - offset, sample_min, sample_max), np.nan)
-        bottom_extension = np.where(
-            np.isfinite(bottom_source),
-            np.clip(bottom_source + offset, sample_min, sample_max),
+        horizon_grids = {name: grid.copy() for name, grid in self._horizon_grids.items()}
+        horizon_names = list(self.horizon_names)
+        top_offset = float(top_count) * float(self.geometry["sample_step"])
+        bottom_offset = float(bottom_count) * float(self.geometry["sample_step"])
+        top_candidate = np.where(
+            np.isfinite(top_source),
+            np.clip(top_source - top_offset, sample_min, sample_max),
             np.nan,
         )
+        bottom_candidate = np.where(
+            np.isfinite(bottom_source),
+            np.clip(bottom_source + bottom_offset, sample_min, sample_max),
+            np.nan,
+        )
+        # A side whose requested offset is entirely clipped at the current
+        # axis boundary would create a zero-thickness outer zone.  Omit that
+        # side rather than allowing the extra pair to invalidate the original
+        # target interval on those traces.
+        top_finite = np.isfinite(top_source)
+        bottom_finite = np.isfinite(bottom_source)
+        top_active = top_count > 0 and np.any(top_finite) and np.any(
+            top_candidate[top_finite] < top_source[top_finite]
+        )
+        bottom_active = bottom_count > 0 and np.any(bottom_finite) and np.any(
+            bottom_candidate[bottom_finite] > bottom_source[bottom_finite]
+        )
+        if top_active:
+            horizon_names.insert(0, top_extension_name)
+            horizon_grids[top_extension_name] = top_candidate
+        if bottom_active:
+            horizon_names.append(bottom_extension_name)
+            horizon_grids[bottom_extension_name] = bottom_candidate
 
         return self._clone_with_horizon_grids(
-            horizon_names=[top_extension_name, *self.horizon_names, bottom_extension_name],
-            horizon_grids={
-                top_extension_name: top_extension,
-                **{name: grid.copy() for name, grid in self._horizon_grids.items()},
-                bottom_extension_name: bottom_extension,
-            },
+            horizon_names=horizon_names,
+            horizon_grids=horizon_grids,
         )
 
     def to_mask(

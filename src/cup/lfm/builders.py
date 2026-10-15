@@ -170,10 +170,14 @@ def _target_mask(context: LfmContext) -> tuple[np.ndarray, np.ndarray, np.ndarra
     trace_valid = _target_trace_mask(context)
     samples = context.output_geometry.samples
     if context.output_geometry.is_section:
-        u = (samples[None, :] - top[:, None]) / (bottom[:, None] - top[:, None])
+        numerator = samples[None, :] - top[:, None]
+        denominator = bottom[:, None] - top[:, None]
+        u = np.divide(numerator, denominator, out=np.full_like(numerator, np.nan), where=denominator != 0.0)
         valid = trace_valid[:, None] & np.isfinite(u)
     else:
-        u = (samples[None, None, :] - top[:, :, None]) / (bottom[:, :, None] - top[:, :, None])
+        numerator = samples[None, None, :] - top[:, :, None]
+        denominator = bottom[:, :, None] - top[:, :, None]
+        u = np.divide(numerator, denominator, out=np.full_like(numerator, np.nan), where=denominator != 0.0)
         valid = trace_valid[:, :, None] & np.isfinite(u)
     return u, valid & _sample_cell_support(samples, top, bottom), bottom - top
 
@@ -186,8 +190,15 @@ def _target_trace_mask(context: LfmContext) -> np.ndarray:
         for horizon_name in context.target_zone.horizon_names
     ]
     valid = np.ones(context.output_geometry.lateral_shape, dtype=bool)
-    for top, bottom in zip(surfaces[:-1], surfaces[1:]):
-        valid &= np.isfinite(top) & np.isfinite(bottom) & (bottom > top)
+    extension_horizons = {
+        str(name)
+        for name in context.common_sources.get("context_extension_horizons", ())
+    }
+    names = context.target_zone.horizon_names
+    for top_name, bottom_name, top, bottom in zip(names[:-1], names[1:], surfaces[:-1], surfaces[1:]):
+        is_context_pair = top_name in extension_horizons or bottom_name in extension_horizons
+        thickness_valid = bottom >= top if is_context_pair else bottom > top
+        valid &= np.isfinite(top) & np.isfinite(bottom) & thickness_valid
     return valid
 
 
@@ -276,7 +287,12 @@ class TrendBuilder:
         for control in filtered:
             top = _surface_along_control(context, names[0], control)
             bottom = _surface_along_control(context, names[-1], control)
-            u = (context.sample_axis.values - top) / (bottom - top)
+            u = np.divide(
+                context.sample_axis.values - top,
+                bottom - top,
+                out=np.full_like(top, np.nan),
+                where=(bottom - top) != 0.0,
+            )
             valid = control.valid_mask & np.isfinite(u) & (bottom > top) & (u >= 0.0) & (u <= 1.0)
             n_valid = int(np.count_nonzero(valid))
             if n_valid < min_valid:
@@ -373,7 +389,12 @@ def _control_zone_coordinates(
 ) -> tuple[np.ndarray, np.ndarray]:
     top = _surface_along_control(context, top_name, control)
     bottom = _surface_along_control(context, bottom_name, control)
-    u = (context.sample_axis.values - top) / (bottom - top)
+    u = np.divide(
+        context.sample_axis.values - top,
+        bottom - top,
+        out=np.full_like(top, np.nan),
+        where=(bottom - top) != 0.0,
+    )
     valid = control.valid_mask & np.isfinite(u) & (bottom > top) & (u >= 0.0) & (u <= 1.0)
     indices = np.flatnonzero(valid)
     if indices.size < 2:
@@ -405,8 +426,13 @@ def _write_volume_zone_blocks(
         inline_stop = min(inline_start + _VOLUME_INLINE_BLOCK_SIZE, n_inline)
         top_block = top[inline_start:inline_stop, :]
         bottom_block = bottom[inline_start:inline_stop, :]
-        u_grid = (samples[None, None, :] - top_block[:, :, None]) / (
-            bottom_block[:, :, None] - top_block[:, :, None]
+        numerator = samples[None, None, :] - top_block[:, :, None]
+        denominator = bottom_block[:, :, None] - top_block[:, :, None]
+        u_grid = np.divide(
+            numerator,
+            denominator,
+            out=np.full_like(numerator, np.nan),
+            where=denominator != 0.0,
         )
         zone_valid = target_trace_valid[inline_start:inline_stop, :, None] & np.isfinite(u_grid)
         zone_valid &= _sample_cell_support(samples, top_block, bottom_block)
@@ -593,7 +619,14 @@ class ProportionalKrigingBuilder:
             bottom = _surface_for_output(context, bottom_name)
             samples = context.output_geometry.samples
             if context.output_geometry.is_section:
-                u_grid = (samples[None, :] - top[:, None]) / (bottom[:, None] - top[:, None])
+                numerator = samples[None, :] - top[:, None]
+                denominator = bottom[:, None] - top[:, None]
+                u_grid = np.divide(
+                    numerator,
+                    denominator,
+                    out=np.full_like(numerator, np.nan),
+                    where=denominator != 0.0,
+                )
                 zone_valid = target_trace_valid[:, None] & np.isfinite(u_grid)
                 zone_valid &= _sample_cell_support(samples, top, bottom)
                 # Invalid horizon traces remain outside the authoritative mask,

@@ -50,6 +50,7 @@ class ObservationBatch:
     observed_seismic: Tensor
     observed_mask: Tensor
     velocity_mps: Tensor | None = None
+    output_mask: Tensor | None = None
 
     def __post_init__(self) -> None:
         expected = (len(self.keys), self.sample_axis.values.size)
@@ -62,6 +63,12 @@ class ObservationBatch:
             raise TypeError("Observation masks must be boolean.")
         if self.velocity_mps is not None and self.velocity_mps.shape != expected:
             raise ValueError("Fixed velocity must match the common trace shape.")
+        if self.output_mask is None:
+            object.__setattr__(self, "output_mask", self.lfm_mask)
+        if self.output_mask.shape != expected or self.output_mask.dtype != torch.bool:
+            raise ValueError("Output support must be a matching boolean trace mask.")
+        if bool((self.output_mask & ~self.lfm_mask).any().item()):
+            raise ValueError("Output support must lie inside the calculation LFM support.")
 
 
 @dataclass(frozen=True)

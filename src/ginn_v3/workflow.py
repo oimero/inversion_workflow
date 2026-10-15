@@ -356,8 +356,8 @@ def _build_velocity(
         raise ValueError(f"Unsupported seismic domain: {lfm.sample_axis.domain!r}.")
     if (path_value is None) == (relation_info is None):
         raise ValueError("Depth inversion requires exactly one of velocity_volume and ai_velocity_relation.")
-    values = np.asarray(lfm.log_ai)
-    support = np.asarray(lfm.valid_mask, dtype=bool)
+    values = np.asarray(lfm.calculation_log_ai)
+    support = np.asarray(lfm.calculation_mask, dtype=bool)
     if path_value is not None:
         path = resolve_relative_path(str(path_value), root=REPO_ROOT)
         velocity = np.asarray(np.load(path, mmap_mode="r", allow_pickle=False), dtype=np.float32)
@@ -496,17 +496,19 @@ def _resolve_runtime(
     trusted_names = _resolve_trusted_names(section, overrides, controls=controls, workflow=workflow)
     data = prepare_training_data(
         source,
-        np.asarray(lfm.log_ai),
-        np.asarray(lfm.valid_mask, dtype=bool),
+        np.asarray(lfm.calculation_log_ai),
+        np.asarray(lfm.calculation_mask, dtype=bool),
         controls,
         evaluation_supports,
         trusted_names,
         training_config,
         velocity_mps=velocity_mps,
         normalization=normalization,
+        output_mask=np.asarray(lfm.valid_mask, dtype=bool),
     )
     runtime_normalization = _normalization_from(data.reader.normalization)
-    physics = AcousticPhysics(sample_axis, wavelet_time_s)
+    physics = AcousticPhysics(sample_axis, wavelet_time_s,
+                              complete_outer_response=lfm.context_log_ai is not None)
     return _Runtime(
         raw=raw,
         section=section,

@@ -9,7 +9,7 @@ belong here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
@@ -142,6 +142,7 @@ class TraceReader:
         lfm_mask: np.ndarray,
         normalization: Normalization,
         velocity_mps: np.ndarray | None = None,
+        output_mask: np.ndarray | None = None,
     ) -> None:
         self.source = source
         self.sample_axis = source.sample_axis
@@ -162,6 +163,9 @@ class TraceReader:
             raise ValueError("lfm_mask must exactly describe finite LFM support.")
         self.lfm_log_ai = lfm
         self.lfm_mask = mask
+        self.output_mask = mask if output_mask is None else np.asarray(output_mask, dtype=bool)
+        if self.output_mask.shape != expected or np.any(self.output_mask & ~mask):
+            raise ValueError("Output mask must match the volume shape and lie inside LFM support.")
         if not isinstance(normalization, Normalization):
             raise TypeError("normalization must be ginn_v3.types.Normalization.")
         self.normalization = normalization
@@ -284,6 +288,7 @@ class TraceReader:
         initial_rows: list[np.ndarray] = []
         lfm_masks: list[np.ndarray] = []
         observed_masks: list[np.ndarray] = []
+        output_masks: list[np.ndarray] = []
         velocity_rows: list[np.ndarray] = []
         for row in weight_rows:
             observed, observed_mask, lfm, velocity = self._weighted_trace(row, raw)
@@ -304,6 +309,9 @@ class TraceReader:
             initial_rows.append(initial)
             lfm_masks.append(lfm_mask)
             observed_masks.append(observed_mask)
+            output_masks.append(np.logical_or.reduce([
+                self.output_mask[key.inline_index, key.xline_index] for key, weight in row if weight > 0.0
+            ]))
             if self.velocity_mps is not None:
                 velocity_rows.append(
                     np.zeros(n, dtype=np.float32) if velocity is None else velocity
@@ -318,6 +326,7 @@ class TraceReader:
             observed_seismic=tensor(raw_rows, torch.float32),
             observed_mask=tensor(observed_masks, torch.bool),
             velocity_mps=(tensor(velocity_rows, torch.float32) if velocity_rows else None),
+            output_mask=tensor(output_masks, torch.bool),
         )
 
     def batch(
@@ -786,10 +795,14 @@ def fit_normalization(
     *,
     lfm_log_ai: np.ndarray | None = None,
     lfm_mask: np.ndarray | None = None,
+    lfm_statistics_mask: np.ndarray | None = None,
 ) -> Normalization:
     """Fit one frozen global normalization from the specified training data."""
 
     source, lfm, mask = _source_lfm(source_or_reader, lfm_log_ai, lfm_mask)
+    statistics_mask = mask if lfm_statistics_mask is None else np.asarray(lfm_statistics_mask, dtype=bool)
+    if statistics_mask.shape != mask.shape or np.any(statistics_mask & ~mask):
+        raise ValueError("LFM statistics mask must lie inside the calculation support.")
     selected = tuple(_as_key(value) for value in train_keys)
     if not selected:
         raise ValueError("Cannot fit normalization from an empty training trace set.")
@@ -801,7 +814,7 @@ def fit_normalization(
         for key in chunk:
             seismic = np.asarray(traces[(key.inline_index, key.xline_index)], dtype=np.float64)
             seismic_parts.append(seismic[np.isfinite(seismic)])
-            support = mask[key.inline_index, key.xline_index, :] & np.isfinite(lfm[key.inline_index, key.xline_index, :])
+            support = statistics_mask[key.inline_index, key.xline_index, :]
             lfm_parts.append(np.asarray(lfm[key.inline_index, key.xline_index, :], dtype=np.float64)[support])
     seismic_values = np.concatenate([part for part in seismic_parts if part.size])
     lfm_values = np.concatenate([part for part in lfm_parts if part.size])
@@ -846,6 +859,8 @@ def prepare_training_data(
     config: TrainingConfig,
     velocity_mps: np.ndarray | None = None,
     normalization: Normalization | None = None,
+    *,
+    output_mask: np.ndarray | None = None,
 ) -> TrainingData:
     """Prepare the complete independent v3 data contract."""
 
@@ -857,6 +872,9 @@ def prepare_training_data(
     masks = np.asarray(lfm_mask, dtype=bool)
     if values.shape != _expected_shape(source) or masks.shape != _expected_shape(source):
         raise ValueError(f"LFM arrays must both have shape {_expected_shape(source)}.")
+    output_support = masks if output_mask is None else np.asarray(output_mask, dtype=bool)
+    if output_support.shape != masks.shape or np.any(output_support & ~masks):
+        raise ValueError("Output support must match the LFM shape and lie inside calculation support.")
     targets = build_well_targets(
         controls,
         geometry=source.geometry,
@@ -864,6 +882,13 @@ def prepare_training_data(
         lfm_mask=masks,
         evaluation_supports=evaluation_supports,
     )
+    evaluation_targets = {}
+    for name, target in targets.items():
+        _values, target_support = _weighted_volume_trace(values, output_support, target.trace_weights)
+        valid = target.valid_mask & target_support
+        if np.any(target.evaluation_mask & ~valid):
+            raise ValueError(f"{name}: fixed Step-6 evaluation samples must lie inside the output interval.")
+        evaluation_targets[name] = replace(target, log_ai=np.where(valid, target.log_ai, np.nan), valid_mask=valid)
     if trusted_well_names is None:
         trusted_names = tuple(control.well_name for control in controls.controls if control.well_role == "trusted")
     else:
@@ -890,7 +915,7 @@ def prepare_training_data(
     candidates = _lfm_candidate_keys(
         source,
         values,
-        masks,
+        output_support,
         min_support_samples=config.min_support_samples,
     )
     if not candidates:
@@ -907,12 +932,14 @@ def prepare_training_data(
                 f"Selected trace {(key.inline_index, key.xline_index)} lacks usable finite seismic support."
             )
     trusted_targets = tuple(targets[name] for name in targets if name.casefold() in trusted_keys)
+    normalization_targets = tuple(evaluation_targets[name] for name in targets if name.casefold() in trusted_keys)
     frozen_normalization = normalization or fit_normalization(
         source,
         train_keys,
-        trusted_targets,
+        normalization_targets,
         lfm_log_ai=values,
         lfm_mask=masks,
+        lfm_statistics_mask=output_support,
     )
     reader = TraceReader(
         source,
@@ -920,13 +947,14 @@ def prepare_training_data(
         masks,
         frozen_normalization,
         velocity_mps=velocity_mps,
+        output_mask=output_support,
     )
     return TrainingData(
         reader=reader,
         train_keys=tuple(train_keys),
         validation_keys=tuple(validation_keys),
         train_wells=trusted_targets,
-        evaluation_wells=tuple(targets.values()),
+        evaluation_wells=tuple(evaluation_targets.values()),
     )
 
 

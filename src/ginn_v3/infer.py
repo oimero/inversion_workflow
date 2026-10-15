@@ -72,7 +72,7 @@ class Inverter:
         with torch.no_grad():
             prediction = self.model(batch.features, batch.initial_log_ai)
         log_ai = prediction.log_ai.detach().cpu().numpy().astype(np.float32, copy=True)
-        valid = batch.lfm_mask.detach().cpu().numpy().astype(bool, copy=True)
+        valid = (batch.lfm_mask & batch.output_mask).detach().cpu().numpy().astype(bool, copy=True)
         finite = np.isfinite(log_ai)
         if np.any(valid & ~finite):
             raise FloatingPointError("PIAI produced a non-finite value on finite LFM support.")

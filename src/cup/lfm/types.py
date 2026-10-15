@@ -107,6 +107,8 @@ class LfmVariantResult:
     modifier_fields: dict[str, np.ndarray] = field(default_factory=dict)
     qc_tables: dict[str, pd.DataFrame] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    context_log_ai: np.ndarray | None = None
+    context_valid_mask: np.ndarray | None = None
 
     def validate(self, context: LfmContext) -> None:
         values = np.asarray(self.log_ai, dtype=np.float64)
@@ -121,6 +123,26 @@ class LfmVariantResult:
             raise ValueError("LFM result must be NaN outside valid_mask_model.")
         self.log_ai = values.astype(np.float32)
         self.valid_mask_model = mask
+
+        context_values = self.context_log_ai
+        context_mask = self.context_valid_mask
+        if (context_values is None) != (context_mask is None):
+            raise ValueError("LFM context_log_ai and context_valid_mask must be provided together.")
+        if context_values is not None and context_mask is not None:
+            context_values = np.asarray(context_values, dtype=np.float64)
+            context_mask = np.asarray(context_mask, dtype=bool)
+            if context_values.shape != values.shape or context_mask.shape != values.shape:
+                raise ValueError("LFM context arrays must match the primary result shape.")
+            if np.any(mask & ~context_mask):
+                raise ValueError("LFM context_valid_mask must contain the primary valid_mask_model.")
+            if not np.all(np.isfinite(context_values[context_mask])):
+                raise ValueError("LFM context contains non-finite values inside context_valid_mask.")
+            if np.any(np.isfinite(context_values[~context_mask])):
+                raise ValueError("LFM context must be NaN outside context_valid_mask.")
+            if not np.array_equal(context_values[mask], np.asarray(self.log_ai)[mask]):
+                raise ValueError("LFM context values must equal primary log_ai inside valid_mask_model.")
+            self.context_log_ai = context_values.astype(np.float32)
+            self.context_valid_mask = context_mask
 
 
 class LfmBuilder(Protocol):

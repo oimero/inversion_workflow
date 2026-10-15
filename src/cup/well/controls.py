@@ -563,6 +563,164 @@ def _make_control_from_native(
     return control
 
 
+def _merge_native_context(
+    control: WellControl,
+    *,
+    candidate_coordinates: np.ndarray,
+    candidate_values: np.ndarray,
+    candidate_observed: np.ndarray,
+) -> NativeWellControl:
+    """Merge a full source curve while preserving the existing native layer.
+
+    The source curve is the authority for samples outside the old tie-window
+    support.  The old native interval is copied as one indivisible block,
+    including its NaN gaps, so a slightly different source mapping cannot
+    insert samples into or alter the existing Step-6 contract.
+    """
+
+    candidate_coordinates = np.asarray(candidate_coordinates, dtype=np.float64)
+    candidate_values = np.asarray(candidate_values, dtype=np.float64)
+    candidate_observed = np.asarray(candidate_observed, dtype=bool)
+    if candidate_coordinates.ndim != 1 or candidate_coordinates.size < 2:
+        raise ValueError(f"{control.well_name}: source context has fewer than two samples.")
+    if any(array.shape != candidate_coordinates.shape for array in (candidate_values, candidate_observed)):
+        raise ValueError(f"{control.well_name}: source context arrays have inconsistent shapes.")
+    if np.any(~np.isfinite(candidate_coordinates)) or np.any(np.diff(candidate_coordinates) <= 0.0):
+        raise ValueError(f"{control.well_name}: source context coordinates must be strictly increasing.")
+
+    old = control.native
+    old_start = float(old.coordinates[0])
+    old_stop = float(old.coordinates[-1])
+    before = candidate_coordinates < old_start
+    after = candidate_coordinates > old_stop
+    coordinates = np.concatenate((candidate_coordinates[before], old.coordinates, candidate_coordinates[after]))
+    values = np.concatenate((candidate_values[before], old.native_filtered_log_ai, candidate_values[after]))
+    observed = np.concatenate((candidate_observed[before], old.observed_mask, candidate_observed[after]))
+    return NativeWellControl(
+        well_name=old.well_name,
+        coordinates=coordinates,
+        native_filtered_log_ai=values,
+        valid_mask=np.isfinite(values),
+        observed_mask=observed & np.isfinite(values),
+        sample_domain=old.sample_domain,
+        sample_unit=old.sample_unit,
+        depth_basis=old.depth_basis,
+        provenance=dict(old.provenance),
+    )
+
+
+def _fixed_vertical_positions(control: WellControl) -> tuple[float, float, float, float]:
+    positions = (
+        np.asarray(control.inline_by_sample, dtype=np.float64),
+        np.asarray(control.xline_by_sample, dtype=np.float64),
+        np.asarray(control.x_m_by_sample, dtype=np.float64),
+        np.asarray(control.y_m_by_sample, dtype=np.float64),
+    )
+    result: list[float] = []
+    for values in positions:
+        finite = values[np.isfinite(values)]
+        if finite.size == 0 or not np.allclose(finite, finite[0], rtol=0.0, atol=1.0e-6):
+            raise ValueError(f"{control.well_name}: vertical context extension requires fixed well positions.")
+        result.append(float(finite[0]))
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _extend_vertical_control(
+    control: WellControl,
+    *,
+    candidate_coordinates: np.ndarray,
+    candidate_values: np.ndarray,
+    candidate_observed: np.ndarray,
+    context_provenance: Mapping[str, Any],
+) -> WellControl:
+    """Add finite source runs outside the old support to a trusted vertical well."""
+
+    if str(control.wellbore_class).casefold() != "vertical":
+        return control
+    native = _merge_native_context(
+        control,
+        candidate_coordinates=candidate_coordinates,
+        candidate_values=candidate_values,
+        candidate_observed=candidate_observed,
+    )
+    axis = np.asarray(control.sample_axis.values, dtype=np.float64)
+    model_from_native = _interp_finite_runs(axis, native.coordinates, native.native_filtered_log_ai)
+    observed_from_native = _interp_finite_runs(
+        axis,
+        native.coordinates,
+        np.where(native.observed_mask, native.native_filtered_log_ai, np.nan),
+    )
+    old_values = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
+    old_valid = np.asarray(control.valid_mask, dtype=bool)
+    old_observed = np.asarray(control.observed_valid_mask, dtype=bool)
+    model_values = model_from_native.copy()
+    model_values[old_valid] = old_values[old_valid]
+    added = np.isfinite(model_values) & ~old_valid
+    inline = np.asarray(control.inline_by_sample, dtype=np.float64).copy()
+    xline = np.asarray(control.xline_by_sample, dtype=np.float64).copy()
+    x_m = np.asarray(control.x_m_by_sample, dtype=np.float64).copy()
+    y_m = np.asarray(control.y_m_by_sample, dtype=np.float64).copy()
+    if np.any(added):
+        fixed = _fixed_vertical_positions(control)
+        for values, value in zip((inline, xline, x_m, y_m), fixed):
+            values[added] = value
+    observed = old_observed.copy()
+    observed[~old_valid] = np.isfinite(observed_from_native[~old_valid])
+    provenance = dict(control.provenance)
+    provenance["context_extension"] = dict(context_provenance)
+    return control_from_arrays(
+        well_name=control.well_name,
+        sample_axis=control.sample_axis,
+        model_grid_filtered_log_ai=model_values,
+        inline=inline,
+        xline=xline,
+        x_m=x_m,
+        y_m=y_m,
+        observed_valid_mask=observed,
+        wellbore_class=control.wellbore_class,
+        sampling_mode=control.sampling_mode,
+        source_run_type=control.source_run_type,
+        provenance=provenance,
+        native=native,
+        well_role=control.well_role,
+    )
+
+
+def _shifted_source_time_coordinates(
+    source_md: np.ndarray,
+    *,
+    source_tdt: grid.TimeDepthTable,
+    shift_ms: float,
+) -> np.ndarray:
+    if not source_tdt.is_md_domain:
+        raise ValueError("Complete time source TDT must use MD coordinates.")
+    source_md = np.asarray(source_md, dtype=np.float64)
+    source_twt = _interp_no_extrapolation(source_md, np.asarray(source_tdt.md), np.asarray(source_tdt.twt))
+    return source_twt + float(shift_ms) / 1000.0
+
+
+def _shifted_source_depth_coordinates(
+    source_md: np.ndarray,
+    *,
+    source_mapping: pd.DataFrame,
+    kb_m: float,
+    shift_ms: float,
+) -> np.ndarray:
+    source_tvdss = source_mapping["tvdss_m"].to_numpy(dtype=np.float64)
+    source_twt = source_mapping["twt_s"].to_numpy(dtype=np.float64)
+    if np.any(np.diff(source_tvdss) <= 0.0) or np.any(np.diff(source_twt) <= 0.0):
+        raise ValueError("Complete depth source mapping must increase in TVDSS and TWT.")
+    source_depth = np.asarray(source_md, dtype=np.float64) - float(kb_m)
+    inside_depth = (source_depth >= source_tvdss[0]) & (source_depth <= source_tvdss[-1])
+    source_t0 = np.full(source_depth.shape, np.nan, dtype=np.float64)
+    source_t0[inside_depth] = np.interp(source_depth[inside_depth], source_tvdss, source_twt)
+    shifted_twt = source_t0 + float(shift_ms) / 1000.0
+    inside_time = inside_depth & (shifted_twt >= source_twt[0]) & (shifted_twt <= source_twt[-1])
+    result = np.full(source_depth.shape, np.nan, dtype=np.float64)
+    result[inside_time] = np.interp(shifted_twt[inside_time], source_twt, source_tvdss)
+    return result
+
+
 def _time_control(
     *,
     source_row: Mapping[str, Any],
@@ -618,7 +776,7 @@ def _time_control(
         sampling_mode = "optimized_trace_plan"
         transform_path = trace_plan_path
     native_twt = _interp_no_extrapolation(native_md, table_md, table_twt)
-    return _make_control_from_native(
+    control = _make_control_from_native(
         well_name=well_name,
         sample_axis=sample_axis,
         native_coordinates=native_twt,
@@ -641,6 +799,46 @@ def _time_control(
         depth_basis=None,
         line_geometry=line_geometry,
         well_role=well_role,
+    )
+    if source_las_role != "filtered" or well_role != "trusted":
+        return control
+
+    source_tdt_path = _required_artifact_path(
+        source_row.get("source_tdt_file"),
+        root=repo_root,
+        run_dir=source_run_dir,
+        label=(
+            f"{well_name} complete source TDT; rerun Step 4 to produce "
+            "source_tdt_file"
+        ),
+    )
+    source_tdt = load_workflow_time_depth_table_csv(source_tdt_path)
+    shift_ms = _finite_number(
+        source_row.get("best_table_shift_ms"),
+        label=f"{well_name}.best_table_shift_ms",
+    )
+    candidate_coordinates = _shifted_source_time_coordinates(
+        native_md,
+        source_tdt=source_tdt,
+        shift_ms=shift_ms,
+    )
+    support = np.isfinite(candidate_coordinates)
+    if int(np.count_nonzero(support)) < 2:
+        raise ValueError(f"{well_name}: complete source TDT has fewer than two source LAS samples in support.")
+    source_provenance = {
+        "method": "complete_source_tdt_plus_best_constant_table_shift",
+        "source_tdt_path": str(source_tdt_path),
+        "optimized_tdt_path": str(tdt_path),
+        "best_table_shift_ms": float(shift_ms),
+        "no_extrapolation": True,
+        "original_model_grid_support_preserved": True,
+    }
+    return _extend_vertical_control(
+        control,
+        candidate_coordinates=candidate_coordinates[support],
+        candidate_values=native_log_ai[support],
+        candidate_observed=native_observed[support],
+        context_provenance=source_provenance,
     )
 
 
@@ -670,7 +868,11 @@ def _depth_control(
         source_row.get("source_depth_mapping_file"), root=repo_root, run_dir=source_run_dir, label=f"{well_name} source depth mapping"
     )
     aligned = _read_axis_mapping(aligned_depth_path, columns={"md_m", "tvdss_m"}, label=f"{well_name} aligned depth mapping")
-    _read_axis_mapping(source_depth_mapping_path, columns={"tvdss_m", "twt_s"}, label=f"{well_name} source depth mapping")
+    source_mapping = _read_axis_mapping(
+        source_depth_mapping_path,
+        columns={"tvdss_m", "twt_s"},
+        label=f"{well_name} source depth mapping",
+    )
     aligned_md = aligned["md_m"].to_numpy(dtype=np.float64)
     aligned_tvdss = aligned["tvdss_m"].to_numpy(dtype=np.float64)
     if np.any(np.diff(aligned_md) <= 0.0) or np.any(np.diff(aligned_tvdss) <= 0.0):
@@ -688,7 +890,7 @@ def _depth_control(
         line_geometry=line_geometry,
         trace_lookup=trace_lookup,
     )
-    return _make_control_from_native(
+    control = _make_control_from_native(
         well_name=well_name,
         sample_axis=sample_axis,
         native_coordinates=native_tvdss,
@@ -713,6 +915,39 @@ def _depth_control(
         depth_basis="tvdss",
         line_geometry=line_geometry,
         well_role=well_role,
+    )
+    if source_las_role != "filtered" or well_role != "trusted" or wellbore_class != "vertical":
+        return control
+
+    kb_m = _finite_number(inventory_row.get("kb_m"), label=f"{well_name}.kb_m")
+    shift_ms = _finite_number(
+        source_row.get("best_table_shift_ms"),
+        label=f"{well_name}.best_table_shift_ms",
+    )
+    candidate_coordinates = _shifted_source_depth_coordinates(
+        native_md,
+        source_mapping=source_mapping,
+        kb_m=kb_m,
+        shift_ms=shift_ms,
+    )
+    support = np.isfinite(candidate_coordinates)
+    if int(np.count_nonzero(support)) < 2:
+        raise ValueError(f"{well_name}: complete source depth mapping has fewer than two source LAS samples in support.")
+    source_provenance = {
+        "method": "source_t0_plus_best_constant_table_shift_then_source_mapping_inverse",
+        "source_depth_mapping_path": str(source_depth_mapping_path),
+        "optimized_tdt_path": str(source_row.get("optimized_tdt_file") or ""),
+        "best_table_shift_ms": float(shift_ms),
+        "kb_m": float(kb_m),
+        "no_extrapolation": True,
+        "original_model_grid_support_preserved": True,
+    }
+    return _extend_vertical_control(
+        control,
+        candidate_coordinates=candidate_coordinates[support],
+        candidate_values=native_log_ai[support],
+        candidate_observed=native_observed[support],
+        context_provenance=source_provenance,
     )
 
 
@@ -878,6 +1113,12 @@ def build_well_control_set(
         raise ValueError("Source run summary metrics path does not match the selected source run.")
     metrics = pd.read_csv(metrics_path)
     _required_columns(metrics, {"well_name", "tie_status", "filtered_las_file", "optimized_tdt_file"}, path=metrics_path)
+    if domain == "time":
+        if "source_tdt_file" not in metrics:
+            raise ValueError("Time well controls require source_tdt_file; rerun Step 4 to save the complete source TDT.")
+        _required_columns(metrics, {"source_tdt_file", "best_table_shift_ms"}, path=metrics_path)
+    elif domain == "depth":
+        _required_columns(metrics, {"best_table_shift_ms"}, path=metrics_path)
     metric_names = [normalize_well_name(value) for value in metrics["well_name"]]
     if any(name.casefold() in invalid_names for name in metric_names) or len(metric_names) != len(set(metric_names)):
         raise ValueError(f"Source metrics well names must be non-empty and unique after normalization: {metrics_path}")

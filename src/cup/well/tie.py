@@ -62,6 +62,7 @@ class WellTieResult:
     optimized_corr: float | None = None
     optimized_nmae: float | None = None
     best_table_shift_ms: float | None = None
+    source_tdt_file: str = ""
     wavelet_file: str = ""
     optimized_tdt_file: str = ""
     qc_figure_dir: str = ""

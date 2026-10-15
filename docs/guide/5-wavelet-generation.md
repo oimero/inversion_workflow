@@ -203,7 +203,7 @@ wavelet_generation:
 | `batch_synthetic_metrics.csv` | 先按 `corr` 排序 | 使用全局子波后每口井的合成记录指标 |
 | `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 六 panel 波形 QC 图（波阻抗、反射系数、合成 wiggle、观测 wiggle、残差 wiggle、互相关）；标题含 `corr`、`nmae`、`scale` 指标 |
 | `synthetic_qc/*.csv` | 需要逐样点复核时 | 每口井的地震道、反射系数、合成记录和残差 |
-| `figures/selected_wavelet.png` | 检查最终子波形态时 | 全局子波、最佳候选和共识子波的形态对比 |
+| `figures/selected_wavelet.png`、`figures/selected_wavelet.svg` | 检查子波形态与频带时 | 左侧对比共识子波与最佳候选子波，右侧对比各自归一化到峰值 1 的幅度谱 |
 
 逐井指标中的 `n_eval_samples` 表示实际用于波形指标的有限样点数。它反映评价输入经过边界和有限值检查后的实际样点数。
 
@@ -267,13 +267,15 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ### 第五步：看图
 
-`figures/selected_wavelet.png` 叠加了最终选中的全局子波、最佳候选子波和共识子波（如果是 consensus 模式）。三条曲线应该形态接近——如果共识子波有明显的旁瓣或相位偏移，检查对应的正则化项是否需要调整权重。
+`figures/selected_wavelet.png` 左侧叠加共识子波与最佳候选子波，绿色表示共识子波，橙色表示最佳候选，幅度沿用子波数据本身的归一化尺度。右侧显示两者的幅度谱，各自归一化到峰值 1，频率显示上限为 125 Hz，并受采样奈奎斯特频率限制。两侧使用相同颜色，便于比较形态和频带。图件同时提供矢量版本。
 
 ### 第六步：抽查合成记录
 
 打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `figures/batch_synthetic_qc/*.png`，核对地震和合成记录在关键层位附近的对齐情况。如果少数井的指标明显偏低，可将其加入 `evaluation_wells.exclude_wells` 后重跑。
 
-每井 QC 图第二个子图的红线是该井单独最小二乘缩放后的合成记录，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位和残差，不用于判断全局固定振幅尺度。
+每井 QC 图的合成地震子图显示该井单独最小二乘缩放后的合成记录，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位和残差，不用于判断全局固定振幅尺度。
+
+层位标注采用目标区间配置中的层位名称。图中只标注当前曲线段覆盖的层位，纵向范围由曲线的有效区间确定。
 
 ---
 

@@ -62,20 +62,106 @@ def load_yaml_mapping(path: Path) -> dict[str, Any]:
         raise ValueError(f"Expected a mapping in {path}.")
     return dict(value)
 
+
+def _finite_shift_ms(value: Any, *, path: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{path} must be a finite number.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} must be a finite number.") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{path} must be a finite number.")
+    return number
+
+
+def _load_shift_mapping(
+    value: Any,
+    *,
+    path: str,
+    casefold_keys: bool,
+) -> dict[str, float]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping.")
+    result: dict[str, float] = {}
+    seen: set[str] = set()
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError(f"{path} keys must be non-empty strings.")
+        key = raw_key.strip()
+        normalized = key.casefold() if casefold_keys else key
+        if normalized in seen:
+            raise ValueError(f"{path} contains duplicate keys ignoring case: {key!r}.")
+        seen.add(normalized)
+        result[key] = _finite_shift_ms(raw_value, path=f"{path}.{key}")
+    return result
+
+
+def _merge_shift_mapping(
+    base: dict[str, float], updates: Mapping[str, float], *, casefold_keys: bool
+) -> None:
+    existing = {key.casefold() if casefold_keys else key: key for key in base}
+    for key, value in updates.items():
+        normalized = key.casefold() if casefold_keys else key
+        previous = existing.get(normalized)
+        if previous is not None:
+            del base[previous]
+        base[key] = float(value)
+        existing[normalized] = key
+
+
 def load_manual_shift_config(manual_cfg: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
+    if not isinstance(manual_cfg, Mapping):
+        raise ValueError("coarse_correction.manual_shift must be a mapping.")
     config = {
-        "default_ms": float(manual_cfg.get("default_ms", 0.0) or 0.0),
-        "by_route_ms": dict(manual_cfg.get("by_route_ms") or {}),
-        "wells_ms": {},
+        "default_ms": _finite_shift_ms(
+            manual_cfg.get("default_ms", 0.0),
+            path="coarse_correction.manual_shift.default_ms",
+        ),
+        "by_route_ms": _load_shift_mapping(
+            manual_cfg.get("by_route_ms"),
+            path="coarse_correction.manual_shift.by_route_ms",
+            casefold_keys=False,
+        ),
+        "wells_ms": _load_shift_mapping(
+            manual_cfg.get("wells_ms"),
+            path="coarse_correction.manual_shift.wells_ms",
+            casefold_keys=True,
+        ),
     }
     config_file = str(manual_cfg.get("config_file") or "").strip()
     if config_file:
         shifts = load_yaml_mapping(resolve_repo_path(config_file, repo_root=repo_root))
-        shifts = dict(shifts.get("manual_shift") or shifts)
+        nested = shifts.get("manual_shift")
+        if nested is not None:
+            if not isinstance(nested, Mapping):
+                raise ValueError(f"manual_shift in {config_file} must be a mapping.")
+            shifts = dict(nested)
         if "default_ms" in shifts:
-            config["default_ms"] = float(shifts["default_ms"] or 0.0)
-        config["by_route_ms"].update(dict(shifts.get("by_route_ms") or {}))
-        config["wells_ms"].update(dict(shifts.get("wells_ms") or {}))
+            config["default_ms"] = _finite_shift_ms(
+                shifts["default_ms"],
+                path=f"{config_file}.manual_shift.default_ms",
+            )
+        _merge_shift_mapping(
+            config["by_route_ms"],
+            _load_shift_mapping(
+                shifts.get("by_route_ms"),
+                path=f"{config_file}.manual_shift.by_route_ms",
+                casefold_keys=False,
+            ),
+            casefold_keys=False,
+        )
+        _merge_shift_mapping(
+            config["wells_ms"],
+            _load_shift_mapping(
+                shifts.get("wells_ms"),
+                path=f"{config_file}.manual_shift.wells_ms",
+                casefold_keys=True,
+            ),
+            casefold_keys=True,
+        )
     return config
 
 def manual_shift_seconds(config: dict[str, Any], *, route: str, well_name: str) -> float:
@@ -87,6 +173,7 @@ def manual_shift_seconds(config: dict[str, Any], *, route: str, well_name: str) 
             shift_ms = float(value or 0.0)
             break
     return shift_ms / 1000.0
+
 
 def load_anchor_config(anchor_cfg: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     config = {"default": dict(anchor_cfg.get("default") or {}),
@@ -1183,6 +1270,7 @@ def prepare_depth_route(
     data_root: Path,
     repo_root: Path,
     horizon_cache: dict[str, HorizonSurface],
+    manual_shift_config: dict[str, Any],
 ) -> DepthPrepared:
     if plan.kb_m is None or not np.isfinite(float(plan.kb_m)):
         raise ValueError(f"Depth-domain route requires finite KB for {plan.well_name}.")
@@ -1286,11 +1374,23 @@ def prepare_depth_route(
         clip_reason=";".join(clip_reasons),
         min_samples=int(config["reject"]["min_tie_samples"]),
     )
+    manual_shift = manual_shift_seconds(
+        manual_shift_config,
+        route=plan.route,
+        well_name=plan.well_name,
+    )
+    shifted_table = shift_time_depth_table(prepared.table, manual_shift)
+    shifted_rows = prepared.table_rows.copy()
+    shifted_rows["twt_s"] = np.asarray(shifted_rows["twt_s"], dtype=np.float64) + manual_shift
     prepared = PreparedTieWindow(
-        table=prepared.table,
+        table=shifted_table,
         logset_md=prepared.logset_md,
-        table_rows=prepared.table_rows,
-        report={**prepared.report, **gap_report},
+        table_rows=shifted_rows,
+        report={
+            **prepared.report,
+            **gap_report,
+            **_coarse_report(0.0, manual_shift, None),
+        },
     )
     # Use the fixed source mapping to resample the native depth observation on
     # the wavelet grid.  The mapping is never replaced by the optimized TDT.

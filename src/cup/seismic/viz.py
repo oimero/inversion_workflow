@@ -10,6 +10,7 @@ from matplotlib import gridspec
 from matplotlib.ticker import FormatStrFormatter, FuncFormatter, MaxNLocator
 import numpy as np
 
+from .geometry import SampleAxis
 from wtie.processing import grid
 
 def _plot_trace(
@@ -217,24 +218,42 @@ def _require_same_waveform_basis(label: str, basis: np.ndarray, expected: np.nda
         raise ValueError(f"Waveform QC {label} must share the seismic tie-window basis.")
 
 
+def _require_reflectivity_basis(basis: np.ndarray, expected: np.ndarray) -> None:
+    """Accept legacy same-sample reflectivity or an explicit interface axis."""
+
+    values = np.asarray(basis, dtype=np.float64)
+    if values.shape == expected.shape and np.allclose(values, expected, equal_nan=True):
+        return
+    if expected.size >= 2:
+        midpoint = 0.5 * (expected[:-1] + expected[1:])
+        if values.shape == midpoint.shape and np.allclose(values, midpoint, equal_nan=True):
+            return
+    raise ValueError(
+        "Waveform QC reflectivity must use the seismic tie-window basis or "
+        "the explicit adjacent-sample midpoint basis."
+    )
+
+
 def _plot_impedance_traces(
     traces: Sequence[grid.Log],
     synthetic_ai: grid.Log,
     *,
     fig_axes: tuple,
+    reference_ai: grid.Log | None = None,
 ) -> tuple:
     fig, ax = fig_axes
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["tab:blue"])
     for index, trace in enumerate(traces):
         selected = trace is synthetic_ai
+        reference = reference_ai is not None and trace is reference_ai
         ax.plot(
             trace.values,
             trace.basis,
             label=str(trace.name or f"AI {index + 1}"),
-            color="tab:red" if selected else colors[index % len(colors)],
-            lw=2.0 if selected else 1.0,
-            alpha=1.0 if selected else 0.75,
-            zorder=3 if selected else 2,
+            color="tab:red" if selected else ("0.55" if reference else colors[index % len(colors)]),
+            lw=2.0 if selected else (1.35 if reference else 1.0),
+            alpha=1.0 if selected else (0.95 if reference else 0.75),
+            zorder=3 if selected else (2.5 if reference else 2),
         )
     ax.set_xlabel("AI")
     ax.xaxis.set_label_position("top")
@@ -264,33 +283,66 @@ def _draw_horizon_markers(
     axes: Sequence[plt.Axes],
     markers: Sequence[tuple[float, str]],
 ) -> None:
-    finite_markers = [
-        (float(twt_s), str(label))
-        for twt_s, label in markers
-        if np.isfinite(float(twt_s))
-    ]
-    if not finite_markers:
+    if len(axes) == 0:
         return
+
+    # Keep the marker's original position when assigning colours.  Filtering
+    # by NaN, interval, or display range must not make, for example, the
+    # second of two horizons take the first horizon's colour.
+    marker_count = len(markers)
+    if marker_count == 0:
+        return
+
     colors = (
         ["tab:green", "tab:blue"]
-        if len(finite_markers) == 2
+        if marker_count == 2
         else ["tab:green", "tab:orange", "tab:blue", "tab:purple"]
     )
-    for marker_index, (twt_s, label) in enumerate(finite_markers):
+
+    first_ax = axes[0]
+    y_limits = first_ax.get_ylim()
+    lower, upper = min(y_limits), max(y_limits)
+    visible_markers = []
+    for marker_index, (twt_s, label) in enumerate(markers):
+        value = float(twt_s)
+        if np.isfinite(value) and lower <= value <= upper:
+            visible_markers.append((marker_index, value, str(label)))
+    if not visible_markers:
+        return
+
+    xmin, xmax = first_ax.get_xlim()
+    for marker_index, twt_s, label in visible_markers:
         color = colors[marker_index % len(colors)]
         for ax in axes:
-            ax.axhline(twt_s, color=color, lw=0.9, alpha=0.75, linestyle="--")
-        first_ax = axes[0]
-        xmin, xmax = first_ax.get_xlim()
+            ax.axhline(
+                twt_s,
+                color=color,
+                lw=0.9,
+                alpha=0.75,
+                linestyle="--",
+                clip_on=True,
+            )
+
+        # At an inclusive interval boundary, place the label inward so that
+        # it remains readable without expanding the axes during tight save.
+        va = "center"
+        span = max(upper - lower, 1.0)
+        boundary_tolerance = max(1e-12, span * 1e-12)
+        inverted = y_limits[0] > y_limits[1]
+        if np.isclose(twt_s, lower, atol=boundary_tolerance, rtol=0.0):
+            va = "top" if inverted else "bottom"
+        elif np.isclose(twt_s, upper, atol=boundary_tolerance, rtol=0.0):
+            va = "bottom" if inverted else "top"
         first_ax.text(
             xmin + 0.03 * (xmax - xmin),
             twt_s,
             f" {label}",
-            va="center",
+            va=va,
             ha="left",
             fontsize=8,
             color=color,
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.0},
+            clip_on=True,
         )
 
 
@@ -344,6 +396,7 @@ def plot_well_waveform_qc(
     synthetic_ai: grid.Log | None = None,
     title: str | None = None,
     horizon_markers: Sequence[tuple[float, str]] = (),
+    reference_ai: grid.Log | None = None,
 ) -> tuple:
     """Draw the shared six-panel well waveform QC with true amplitude axes."""
     synthetic_basis = np.asarray(synthetic_seismic.basis, dtype=np.float64)
@@ -354,9 +407,25 @@ def plot_well_waveform_qc(
         equal_nan=True,
     ):
         raise ValueError("Synthetic and real seismic must share the same basis.")
-    _require_same_waveform_basis("reflectivity", reflectivity.basis, real_basis)
+    _require_reflectivity_basis(reflectivity.basis, real_basis)
     _require_same_waveform_basis("dynamic correlation", dxcorr.basis, real_basis)
     impedance_traces, selected_ai = _normalize_ai_traces(logset, synthetic_ai)
+    aligned_reference_index: int | None = None
+    if reference_ai is not None:
+        if not isinstance(reference_ai, grid.Log):
+            raise TypeError("reference_ai must be a grid.Log.")
+        reference_index = next(
+            (
+                index
+                for index, trace in enumerate(impedance_traces)
+                if trace is reference_ai
+            ),
+            None,
+        )
+        if reference_index is None:
+            impedance_traces.append(reference_ai)
+            reference_index = len(impedance_traces) - 1
+        aligned_reference_index = reference_index
     impedance_traces, selected_ai = _align_impedance_traces_to_basis(
         impedance_traces,
         selected_ai,
@@ -380,7 +449,15 @@ def plot_well_waveform_qc(
         fig.add_subplot(gs[5]),
     ]
 
-    _plot_impedance_traces(impedance_traces, selected_ai, fig_axes=(fig, axes[0]))
+    aligned_reference = (
+        None if aligned_reference_index is None else impedance_traces[aligned_reference_index]
+    )
+    _plot_impedance_traces(
+        impedance_traces,
+        selected_ai,
+        fig_axes=(fig, axes[0]),
+        reference_ai=aligned_reference,
+    )
     _plot_reflectivity(reflectivity, fig_axes=(fig, axes[1]))
 
     # seismic
@@ -674,8 +751,138 @@ def sample_volume_at_points(
     return (1.0 - wi) * (1.0 - wj) * t00 + (1.0 - wi) * wj * t01 + wi * (1.0 - wj) * t10 + wi * wj * t11
 
 
+def _cell_edges(values: np.ndarray) -> np.ndarray:
+    """Return cell edges for a one-dimensional array of sample centres."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 1:
+        half_width = 0.5
+        return np.asarray([values[0] - half_width, values[0] + half_width], dtype=np.float64)
+    midpoint = 0.5 * (values[:-1] + values[1:])
+    return np.concatenate(
+        [
+            np.asarray([values[0] - (midpoint[0] - values[0])]),
+            midpoint,
+            np.asarray([values[-1] + (values[-1] - midpoint[-1])]),
+        ]
+    )
+
+
+def plot_seismic_closure_qc(
+    *,
+    synthetic: np.ndarray,
+    observed: np.ndarray,
+    valid_mask: np.ndarray,
+    lateral_coordinates_m: np.ndarray,
+    sample_axis: SampleAxis,
+    amplitude_limit: float,
+    title: str,
+    correlation: float | None,
+) -> tuple:
+    """Draw forward, observed, and target-interval residual seismic sections.
+
+    The arrays use ``(trace, sample)`` order. Values are rendered in their
+    supplied coordinates without lateral interpolation or amplitude scaling.
+    ``valid_mask`` limits the forward and residual panels; observed seismic is
+    shown wherever its own values are finite.
+    """
+    if not isinstance(sample_axis, SampleAxis):
+        raise TypeError("sample_axis must be a SampleAxis.")
+
+    synthetic_values = np.asarray(synthetic, dtype=np.float64)
+    observed_values = np.asarray(observed, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if synthetic_values.ndim != 2:
+        raise ValueError(f"synthetic must be 2-D (trace, sample), got {synthetic_values.shape}.")
+    if observed_values.shape != synthetic_values.shape:
+        raise ValueError("observed must have the same shape as synthetic.")
+    if valid.shape != synthetic_values.shape:
+        raise ValueError("valid_mask must have the same shape as synthetic.")
+
+    lateral = np.asarray(lateral_coordinates_m, dtype=np.float64).reshape(-1)
+    if lateral.size != synthetic_values.shape[0]:
+        raise ValueError("lateral_coordinates_m must contain one coordinate per trace.")
+    if lateral.size == 0 or np.any(~np.isfinite(lateral)) or (
+        lateral.size > 1 and np.any(np.diff(lateral) <= 0.0)
+    ):
+        raise ValueError("lateral_coordinates_m must be finite and strictly increasing.")
+    if sample_axis.values.size != synthetic_values.shape[1]:
+        raise ValueError("sample_axis must contain one coordinate per sample.")
+
+    limit = float(amplitude_limit)
+    if isinstance(amplitude_limit, (bool, np.bool_)) or not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("amplitude_limit must be a positive finite number.")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("title must be a non-empty string.")
+    if correlation is not None:
+        correlation_value = float(correlation)
+        if not np.isfinite(correlation_value):
+            raise ValueError("correlation must be finite when provided.")
+    else:
+        correlation_value = None
+
+    forward_mask = valid & np.isfinite(synthetic_values)
+    observed_mask = np.isfinite(observed_values)
+    residual_values = observed_values - synthetic_values
+    residual_mask = valid & np.isfinite(observed_values) & np.isfinite(synthetic_values)
+
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad("#d9d9d9")
+    x_edges = _cell_edges(lateral)
+    y_coordinates = np.asarray(sample_axis.values, dtype=np.float64)
+    y_edges = _cell_edges(y_coordinates)
+    panels = (
+        (synthetic_values, forward_mask, "Forward seismic"),
+        (observed_values, observed_mask, "Observed seismic"),
+        (residual_values, residual_mask, "Residual in target interval (observed - forward)"),
+    )
+
+    fig, axes_arr = plt.subplots(
+        3,
+        1,
+        figsize=(12.0, 10.0),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes_arr).reshape(-1).tolist()
+    images = []
+    for ax, (values, mask, panel_title) in zip(axes, panels):
+        ax.set_facecolor("#d9d9d9")
+        image = ax.pcolormesh(
+            x_edges,
+            y_edges,
+            np.ma.masked_where(~mask, values).T,
+            cmap=cmap,
+            vmin=-limit,
+            vmax=limit,
+            shading="flat",
+            rasterized=True,
+        )
+        images.append(image)
+        ax.set_title(panel_title, loc="left", fontsize=11)
+        ax.set_ylim(float(y_coordinates[-1]), float(y_coordinates[0]))
+        ax.grid(False)
+
+    axes[-1].set_xlabel("Lateral distance (m)")
+    axes[0].set_ylabel("Time (s)" if sample_axis.domain == "time" else "TVDSS (m)")
+    colorbar = fig.colorbar(
+        images[0],
+        ax=axes,
+        extend="both",
+        pad=0.02,
+        aspect=35,
+    )
+    colorbar.set_label("Amplitude")
+    figure_title = title.strip()
+    if correlation_value is not None:
+        figure_title = f"{figure_title} (corr = {correlation_value:.3f})"
+    fig.suptitle(figure_title, fontsize=13)
+    return fig, axes
+
+
 __all__ = [
     "impedance_qc_metrics",
+    "plot_seismic_closure_qc",
     "plot_well_impedance_qc",
     "plot_well_waveform_qc",
     "sample_volume_at_points",

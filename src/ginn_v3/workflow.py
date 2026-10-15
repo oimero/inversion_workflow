@@ -73,6 +73,8 @@ class _Runtime:
     velocity_mps: np.ndarray | None
     velocity_source: str
     trusted_well_names: tuple[str, ...]
+    supervision_curve: str
+    body_smoothing_fwhm_axis_units: float | None
 
 
 @dataclass(frozen=True)
@@ -394,6 +396,30 @@ def _normalization_from(value: Any) -> Normalization:
     )})
 
 
+def _supervision_settings(controls: Any) -> tuple[str, float | None]:
+    """Read and validate the curve source recorded by Step 6."""
+
+    curve = str(getattr(controls, "supervision_curve", "filtered")).strip().casefold()
+    if curve not in {"filtered", "body"}:
+        raise ValueError(
+            f"Unsupported Step-6 supervision_curve={curve!r}; expected 'filtered' or 'body'."
+        )
+    raw_fwhm = getattr(controls, "body_smoothing_fwhm_axis_units", None)
+    if raw_fwhm in (None, ""):
+        fwhm = None
+    else:
+        if isinstance(raw_fwhm, (bool, np.bool_)):
+            raise ValueError("Step-6 body_smoothing_fwhm_axis_units must be a finite positive number.")
+        fwhm = float(raw_fwhm)
+        if not np.isfinite(fwhm) or fwhm <= 0.0:
+            raise ValueError("Step-6 body_smoothing_fwhm_axis_units must be finite and positive.")
+    if curve == "body" and fwhm is None:
+        raise ValueError(
+            "Step-6 supervision_curve='body' requires body_smoothing_fwhm_axis_units."
+        )
+    return curve, fwhm
+
+
 def _network_config(section: Mapping[str, Any], *, sample_count: int, wavelet_samples: int) -> NetworkConfig:
     value = section.get("network")
     if value is not None and not isinstance(value, Mapping):
@@ -470,6 +496,7 @@ def _resolve_runtime(
     _require_matching_axes(("survey", sample_axis), ("LFM", lfm.sample_axis))
     controls = load_well_control_set(well_control_run_dir, repo_root=REPO_ROOT)
     _require_matching_axes(("survey", sample_axis), ("well controls", controls.sample_axis))
+    supervision_curve, body_smoothing_fwhm_axis_units = _supervision_settings(controls)
     expected_shape = (
         survey.line_geometry.inline_axis.count,
         survey.line_geometry.xline_axis.count,
@@ -530,6 +557,8 @@ def _resolve_runtime(
         velocity_mps=velocity_mps,
         velocity_source=velocity_source,
         trusted_well_names=trusted_names,
+        supervision_curve=supervision_curve,
+        body_smoothing_fwhm_axis_units=body_smoothing_fwhm_axis_units,
     )
 
 
@@ -555,6 +584,8 @@ def _checkpoint_context(runtime: _Runtime, *, config_path: Path) -> dict[str, An
         "variant_id": runtime.variant_id,
         "well_control_run_dir": repo_relative_path(runtime.well_control_run_dir, root=REPO_ROOT),
         "trusted_well_names": list(runtime.trusted_well_names),
+        "supervision_curve": runtime.supervision_curve,
+        "body_smoothing_fwhm_axis_units": runtime.body_smoothing_fwhm_axis_units,
         "sample_axis": {
             "domain": str(runtime.sample_axis.domain),
             "unit": str(runtime.sample_axis.unit),
@@ -625,10 +656,20 @@ def train_body(
             "kernel": asdict(KernelConfig.from_mapping(section.get("kernel"))),
             "interface_alignment": "midpoint",
             "velocity_source": runtime.velocity_source,
+            "supervision_curve": runtime.supervision_curve,
+            "body_smoothing_fwhm_axis_units": runtime.body_smoothing_fwhm_axis_units,
         },
     )
     trainer = JointTrainer(runtime.data, model, runtime.physics, training_config, logger=logger)
     result = trainer.fit(output, checkpoint_context=_checkpoint_context(runtime, config_path=resolved_config))
+    training_summary_path = output / "training_summary.json"
+    with training_summary_path.open("r", encoding="utf-8") as handle:
+        training_summary = json.load(handle)
+    if not isinstance(training_summary, dict):
+        raise ValueError("training_summary.json must contain an object.")
+    training_summary["supervision_curve"] = runtime.supervision_curve
+    training_summary["body_smoothing_fwhm_axis_units"] = runtime.body_smoothing_fwhm_axis_units
+    write_json(training_summary_path, training_summary)
     selected_payload = load_checkpoint(result.selected_checkpoint, device="cpu")
     qc_metrics = write_well_qc(
         selected_payload["model"],

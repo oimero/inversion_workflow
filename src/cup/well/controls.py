@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -83,6 +83,7 @@ class WellControl:
     provenance: Mapping[str, Any]
     native: "NativeWellControl"
     well_role: str = "trusted"
+    model_grid_body_log_ai: grid.Log | None = None
 
     def __post_init__(self) -> None:
         n = self.sample_axis.values.size
@@ -123,6 +124,14 @@ class WellControl:
         if role not in {"trusted", "background_only"}:
             raise ValueError(f"{self.well_name}: unsupported well_role={self.well_role!r}.")
         object.__setattr__(self, "well_role", role)
+        if (self.model_grid_body_log_ai is None) != (self.native.native_body_log_ai is None):
+            raise ValueError(f"{self.well_name}: body curves must exist on both native and model axes.")
+        if self.model_grid_body_log_ai is not None:
+            body = self.model_grid_body_log_ai
+            if not np.array_equal(body.basis, self.sample_axis.values) or not getattr(body, f"is_{expected_basis}"):
+                raise ValueError(f"{self.well_name}: model body curve must share the canonical sample axis.")
+            if not np.array_equal(np.isfinite(body.values), valid):
+                raise ValueError(f"{self.well_name}: body smoothing must preserve the model valid mask.")
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,7 @@ class NativeWellControl:
     sample_unit: str
     depth_basis: str | None
     provenance: Mapping[str, Any]
+    native_body_log_ai: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         coordinates = np.asarray(self.coordinates, dtype=np.float64)
@@ -163,6 +173,11 @@ class NativeWellControl:
         object.__setattr__(self, "native_filtered_log_ai", values)
         object.__setattr__(self, "valid_mask", valid)
         object.__setattr__(self, "observed_mask", observed)
+        if self.native_body_log_ai is not None:
+            body = np.asarray(self.native_body_log_ai, dtype=np.float64)
+            if body.shape != coordinates.shape or not np.array_equal(np.isfinite(body), valid):
+                raise ValueError(f"{self.well_name}: native body curve must preserve shape and valid support.")
+            object.__setattr__(self, "native_body_log_ai", body)
 
 
 @dataclass(frozen=True)
@@ -174,9 +189,18 @@ class WellControlSet:
     depth_basis: str | None
     source_run_type: str
     provenance: Mapping[str, Any]
+    supervision_curve: str = "filtered"
+    body_smoothing_fwhm_axis_units: float | None = None
 
     def __post_init__(self) -> None:
         validate_sample_axis(self.sample_axis)
+        if self.supervision_curve not in {"filtered", "body"}:
+            raise ValueError("supervision_curve must be 'filtered' or 'body'.")
+        width = self.body_smoothing_fwhm_axis_units
+        if width is not None and (isinstance(width, (bool, np.bool_)) or not np.isfinite(width) or width <= 0.0):
+            raise ValueError("body_smoothing_fwhm_axis_units must be finite and positive.")
+        if self.supervision_curve == "body" and width is None:
+            raise ValueError("Body supervision requires a body smoothing FWHM.")
         if not self.controls:
             raise ValueError("WellControlSet requires at least one valid well.")
         names = [control.well_name.casefold() for control in self.controls]
@@ -187,6 +211,8 @@ class WellControlSet:
         ):
             raise ValueError("WellControlSet depth_basis is inconsistent with its SampleAxis domain.")
         for control in self.controls:
+            if self.supervision_curve == "body" and control.well_role == "trusted" and control.native.native_body_log_ai is None:
+                raise ValueError(f"{control.well_name}: body supervision requires saved body curves.")
             if not np.array_equal(control.sample_axis.values, self.sample_axis.values):
                 raise ValueError(f"{control.well_name}: SampleAxis differs from WellControlSet.")
             if control.sample_axis.domain != self.sample_domain or control.sample_axis.unit != self.sample_unit:
@@ -237,6 +263,7 @@ def control_from_arrays(
     provenance: Mapping[str, Any],
     native: NativeWellControl,
     well_role: str = "trusted",
+    model_grid_body_log_ai: np.ndarray | None = None,
 ) -> WellControl:
     arrays = [
         np.asarray(value, dtype=np.float64).copy()
@@ -270,6 +297,10 @@ def control_from_arrays(
         provenance=dict(provenance),
         native=native,
         well_role=well_role,
+        model_grid_body_log_ai=(None if model_grid_body_log_ai is None else grid.Log(
+            np.asarray(model_grid_body_log_ai, dtype=np.float64), sample_axis.values.copy(), basis_type,
+            name="model_grid_body_log_ai", unit="ln(m/s*g/cm3)",
+        )),
     )
 
 # Source assembly
@@ -924,20 +955,25 @@ def _depth_control(
         source_row.get("best_table_shift_ms"),
         label=f"{well_name}.best_table_shift_ms",
     )
+    coarse_shift_ms = _finite_number(
+        source_row.get("coarse_total_shift_ms", 0.0),
+        label=f"{well_name}.coarse_total_shift_ms",
+    )
     candidate_coordinates = _shifted_source_depth_coordinates(
         native_md,
         source_mapping=source_mapping,
         kb_m=kb_m,
-        shift_ms=shift_ms,
+        shift_ms=coarse_shift_ms + shift_ms,
     )
     support = np.isfinite(candidate_coordinates)
     if int(np.count_nonzero(support)) < 2:
         raise ValueError(f"{well_name}: complete source depth mapping has fewer than two source LAS samples in support.")
     source_provenance = {
-        "method": "source_t0_plus_best_constant_table_shift_then_source_mapping_inverse",
+        "method": "source_t0_plus_coarse_and_fine_table_shifts_then_source_mapping_inverse",
         "source_depth_mapping_path": str(source_depth_mapping_path),
         "optimized_tdt_path": str(source_row.get("optimized_tdt_file") or ""),
         "best_table_shift_ms": float(shift_ms),
+        "coarse_total_shift_ms": float(coarse_shift_ms),
         "kb_m": float(kb_m),
         "no_extrapolation": True,
         "original_model_grid_support_preserved": True,
@@ -1059,10 +1095,27 @@ def build_well_control_set(
     allowed_config = {
         "source_runs", "well_trace_dir", "time_depth_dir", "well_roles",
         "well_role_reasons", "central_trusted_well_names",
+        "supervision_curve", "body_smoothing",
     }
     unknown = set(config) - allowed_config
     if unknown:
         raise ValueError(f"real_field_well_controls has unknown settings: {sorted(unknown)}.")
+    supervision_curve = config.get("supervision_curve", "filtered")
+    if supervision_curve not in {"filtered", "body"}:
+        raise ValueError("real_field_well_controls.supervision_curve must be 'filtered' or 'body'.")
+    body_config = config.get("body_smoothing")
+    body_fwhm = None
+    if body_config is not None:
+        if not isinstance(body_config, Mapping) or set(body_config) != {"fwhm_axis_units"}:
+            raise ValueError("body_smoothing must contain exactly fwhm_axis_units.")
+        value = body_config["fwhm_axis_units"]
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError("body_smoothing.fwhm_axis_units must be a finite positive number.")
+        body_fwhm = _finite_number(value, label="body_smoothing.fwhm_axis_units")
+        if body_fwhm <= 0.0:
+            raise ValueError("body_smoothing.fwhm_axis_units must be positive.")
+    if supervision_curve == "body" and body_fwhm is None:
+        raise ValueError("Body supervision requires real_field_well_controls.body_smoothing.")
     source_runs = config.get("source_runs")
     if not isinstance(source_runs, Mapping):
         raise ValueError("real_field_well_controls.source_runs must be a mapping.")
@@ -1286,6 +1339,8 @@ def build_well_control_set(
         raise ValueError(f"Canonical well controls are missing required wells: {reasons}")
     if not controls:
         raise ValueError("No non-excluded canonical well controls were built.")
+    if body_fwhm is not None:
+        controls = [_with_body_curve(control, fwhm_axis_units=body_fwhm) for control in controls]
     control_set = WellControlSet(
         sample_axis=sample_axis,
         controls=tuple(controls),
@@ -1293,6 +1348,8 @@ def build_well_control_set(
         sample_unit=sample_axis.unit,
         depth_basis=depth_basis,
         source_run_type=SOURCE_RUN_TYPE,
+        supervision_curve=supervision_curve,
+        body_smoothing_fwhm_axis_units=body_fwhm,
         provenance={
             "source_run_path": str(source_run_dir),
             "source_summary_path": str(summary_path),
@@ -1705,6 +1762,40 @@ def _gaussian_smooth_finite_runs(
     return output
 
 
+def _with_body_curve(control: WellControl, *, fwhm_axis_units: float) -> WellControl:
+    """Smooth trusted native log-AI segments, then project once to the model axis."""
+    if control.well_role != "trusted":
+        return control
+    native_body = _gaussian_smooth_finite_runs(
+        control.native.native_filtered_log_ai,
+        control.native.coordinates,
+        fwhm=fwhm_axis_units,
+    )
+    model_body = _interp_finite_runs(
+        control.sample_axis.values, control.native.coordinates, native_body,
+    )
+    model_body[~control.valid_mask] = np.nan
+    native = replace(control.native, native_body_log_ai=native_body)
+    basis_type = "twt" if control.sample_axis.domain == "time" else "tvdss"
+    return replace(
+        control,
+        native=native,
+        model_grid_body_log_ai=grid.Log(
+            model_body, control.sample_axis.values.copy(), basis_type,
+            name="model_grid_body_log_ai", unit="ln(m/s*g/cm3)",
+        ),
+    )
+
+
+def _body_log_ai_for_qc(control: WellControl, *, fwhm: float) -> np.ndarray:
+    if control.model_grid_body_log_ai is not None:
+        return np.asarray(control.model_grid_body_log_ai.values, dtype=np.float64)
+    return _gaussian_smooth_finite_runs(
+        np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64),
+        control.sample_axis.values, fwhm=fwhm,
+    )
+
+
 def _event_windows(
     seismic: np.ndarray,
     *,
@@ -1820,6 +1911,9 @@ def write_depth_well_control_qc(
     if any(isinstance(config[key], (bool, np.bool_)) for key in expected):
         raise ValueError("Step 6 QC numeric settings cannot be boolean.")
     body_fwhm = float(config["body_smoothing_fwhm_m"])
+    saved_width = control_set.body_smoothing_fwhm_axis_units
+    if saved_width is not None and not np.isclose(body_fwhm, saved_width, rtol=0.0, atol=1e-12):
+        raise ValueError("QC body smoothing width must match the saved body curves.")
     dynamic_window = float(config["dynamic_correlation_window_m"])
     threshold_fraction = float(config["event_threshold_fraction"])
     maximum_events = config["max_event_windows_per_well"]
@@ -1842,9 +1936,7 @@ def write_depth_well_control_qc(
         well_dir.mkdir()
         axis = control.sample_axis.values
         model_grid_filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
-        body_log_ai = _gaussian_smooth_finite_runs(
-            model_grid_filtered_log_ai, axis, fwhm=body_fwhm,
-        )
+        body_log_ai = _body_log_ai_for_qc(control, fwhm=body_fwhm)
         real = sample_seismic_along_control(control, survey)
         full_forward = forward_depth_finite_runs(
             model_grid_filtered_log_ai,
@@ -2026,6 +2118,8 @@ def _trusted_control_set(control_set: WellControlSet) -> WellControlSet:
         depth_basis=control_set.depth_basis,
         source_run_type=control_set.source_run_type,
         provenance=control_set.provenance,
+        supervision_curve=control_set.supervision_curve,
+        body_smoothing_fwhm_axis_units=control_set.body_smoothing_fwhm_axis_units,
     )
 
 
@@ -2129,6 +2223,9 @@ def write_well_control_qc(
     if control_set.sample_domain != "time" or control_set.depth_basis is not None:
         raise ValueError("Step 6 QC supports only time or TVDSS depth controls.")
     body_fwhm_s, dynamic_window_s = _time_qc_settings(settings)
+    saved_width = trusted.body_smoothing_fwhm_axis_units
+    if saved_width is not None and not np.isclose(body_fwhm_s, saved_width, rtol=0.0, atol=1e-12):
+        raise ValueError("QC body smoothing width must match the saved body curves.")
     wavelet_time, wavelet_amplitude, _relation, wavelet_path = _load_qc_wavelet(
         config=settings, domain="time", depth_basis=None, repo_root=repo_root
     )
@@ -2142,7 +2239,7 @@ def write_well_control_qc(
         axis = control.sample_axis.values
         real = sample_seismic_along_control(control, survey)
         filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
-        body_log_ai = _gaussian_smooth_finite_runs(filtered_log_ai, axis, fwhm=body_fwhm_s)
+        body_log_ai = _body_log_ai_for_qc(control, fwhm=body_fwhm_s)
         full_forward = forward_time_finite_runs(
             filtered_log_ai,
             wavelet_time_s=wavelet_time,
@@ -2349,6 +2446,8 @@ def write_well_control_set(
             "model_axis_valid_mask_key": "valid_mask",
             "model_axis_observed_valid_mask_key": "observed_valid_mask",
             "native_value_key": "native_filtered_log_ai",
+            "supervision_curve": control_set.supervision_curve,
+            "body_smoothing_fwhm_axis_units": control_set.body_smoothing_fwhm_axis_units,
             "native_source_role": str(control.provenance.get("source_las_role") or "source"),
             "gap_policy": "persist_repaired_short_gaps",
             "provenance": portable_provenance(control.provenance),
@@ -2362,6 +2461,12 @@ def write_well_control_set(
                 "provenance": portable_provenance(control.native.provenance),
             },
         }
+        body_arrays = {}
+        if control.model_grid_body_log_ai is not None:
+            body_arrays = {
+                "model_grid_body_log_ai": np.asarray(control.model_grid_body_log_ai.values, dtype=np.float32),
+                "native_body_log_ai": np.asarray(control.native.native_body_log_ai, dtype=np.float32),
+            }
         np.savez_compressed(
             path,
             samples=control.sample_axis.values.astype(np.float64),
@@ -2377,6 +2482,7 @@ def write_well_control_set(
             native_valid_mask=control.native.valid_mask.astype(bool),
             native_observed_mask=control.native.observed_mask.astype(bool),
             metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
+            **body_arrays,
         )
         match = manifest_out["well_name"].astype(str).str.casefold().eq(control.well_name.casefold())
         manifest_out.loc[match, "well_npz_path"] = repo_relative_path(path, root=repo_root)
@@ -2419,6 +2525,8 @@ def write_well_control_set(
         "depth_basis": control_set.depth_basis,
         "native_source_role": "role_specific_source",
         "gap_policy": "persist_repaired_short_gaps",
+        "supervision_curve": control_set.supervision_curve,
+        "body_smoothing_fwhm_axis_units": control_set.body_smoothing_fwhm_axis_units,
         "counts": {
             "candidate_wells": int(len(manifest_out)),
             "successful_wells": int((manifest_out["status"] == "ok").sum()),
@@ -2565,7 +2673,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     for _, row in successful.iterrows():
         path = resolve_relative_path(str(row["well_npz_path"]), root=repo_root)
         with np.load(path, allow_pickle=False) as data:
-            if set(data.files) != {
+            base_keys = {
                 "samples",
                 "model_grid_filtered_log_ai",
                 "inline",
@@ -2579,8 +2687,13 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 "native_valid_mask",
                 "native_observed_mask",
                 "metadata_json",
-            }:
+            }
+            body_keys = {"model_grid_body_log_ai", "native_body_log_ai"}
+            has_body = body_keys.issubset(data.files)
+            if set(data.files) != base_keys | (body_keys if has_body else set()):
                 raise ValueError(f"Unexpected well-control NPZ keys: {path}")
+            if has_body and any(data[key].dtype != np.dtype("float32") for key in body_keys):
+                raise ValueError(f"Body well-control arrays must be float32: {path}")
             if data["samples"].dtype != np.dtype("float64") or any(
                 data[key].dtype != np.dtype("float64") for key in ("inline", "xline", "x_m", "y_m")
             ):
@@ -2606,6 +2719,10 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
             metadata = json.loads(str(metadata_array.item()))
             if metadata.get("schema_version") != SCHEMA_VERSION:
                 raise ValueError(f"Unsupported well-control NPZ schema: {path}")
+            if metadata.get("supervision_curve", "filtered") != summary.get("supervision_curve", "filtered"):
+                raise ValueError(f"Well-control supervision curve differs from its run summary: {path}")
+            if metadata.get("body_smoothing_fwhm_axis_units") != summary.get("body_smoothing_fwhm_axis_units"):
+                raise ValueError(f"Well-control body smoothing width differs from its run summary: {path}")
             expected_metadata = {
                 "source_run_type": str(summary["source_adapter"]),
                 "well_role": str(row["well_role"]).strip().casefold(),
@@ -2647,6 +2764,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 sample_unit=axis.unit,
                 depth_basis=summary.get("depth_basis"),
                 provenance=dict(native_metadata.get("provenance") or {}),
+                native_body_log_ai=(np.asarray(data["native_body_log_ai"], dtype=np.float64) if has_body else None),
             )
             file_axis = np.asarray(data["samples"], dtype=np.float64)
             if not np.array_equal(file_axis, axis.values):
@@ -2666,6 +2784,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 provenance=dict(metadata["provenance"]),
                 native=native,
                 well_role=str(metadata["well_role"]),
+                model_grid_body_log_ai=(np.asarray(data["model_grid_body_log_ai"], dtype=np.float64) if has_body else None),
             )
             if not np.array_equal(control.valid_mask, np.asarray(data["valid_mask"], dtype=bool)):
                 raise ValueError(f"Well-control NPZ valid_mask disagrees with finite values: {path}")
@@ -2687,6 +2806,8 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         depth_basis=summary.get("depth_basis"),
         source_run_type=str(summary["source_adapter"]),
         provenance=provenance,
+        supervision_curve=summary.get("supervision_curve", "filtered"),
+        body_smoothing_fwhm_axis_units=summary.get("body_smoothing_fwhm_axis_units"),
     )
 
 

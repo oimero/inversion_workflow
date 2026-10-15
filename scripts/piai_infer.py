@@ -25,7 +25,8 @@ if str(SRC_DIR) not in sys.path:
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from cup.seismic.survey import segy_options_from_config
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
-from ginn_v3.qc import write_wavelet_csv, write_well_qc
+from ginn_v3.infer import validate_volume_section_requests, write_volume_section_qc
+from ginn_v3.qc import write_volume_closure_qc, write_wavelet_csv, write_well_qc
 from ginn_v3.workflow import load_body
 
 
@@ -37,12 +38,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--smoke-tile-size", type=int, default=None)
     parser.add_argument("--skip-segy-export", action="store_true")
+    parser.add_argument(
+        "--qc-physical-closure", action="store_true",
+        help="Forward the requested QC sections and plot observed-minus-forward target residuals.",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--lfm-run-dir", type=Path, default=None)
     parser.add_argument("--variant-id", type=str, default=None)
     parser.add_argument("--well-control-run-dir", type=Path, default=None)
     parser.add_argument("--velocity-volume", type=Path, default=None)
     parser.add_argument("--trusted-well-name", action="append", dest="trusted_well_names", default=None)
+    parser.add_argument(
+        "--qc-inline",
+        type=float,
+        action="append",
+        default=None,
+        metavar="LINE",
+        help="Write a linear-AI QC section for this physical inline line; repeat for more lines.",
+    )
+    parser.add_argument(
+        "--qc-xline",
+        type=float,
+        action="append",
+        default=None,
+        metavar="LINE",
+        help="Write a linear-AI QC section for this physical xline line; repeat for more lines.",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +76,8 @@ def _resolve_output_dir(value: Path | None, output_root: str | Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.qc_physical_closure and not (args.qc_inline or args.qc_xline):
+        raise ValueError("--qc-physical-closure requires --qc-inline or --qc-xline.")
     loaded = load_body(
         args.config,
         args.checkpoint,
@@ -80,12 +103,35 @@ def main() -> None:
         xline_start = max(0, (int(shape[1]) - tile) // 2)
         inline_slice = slice(inline_start, min(int(shape[0]), inline_start + tile))
         xline_slice = slice(xline_start, min(int(shape[1]), xline_start + tile))
+    ilines = np.asarray(loaded.lfm.ilines)[inline_slice] if inline_slice is not None else np.asarray(loaded.lfm.ilines)
+    xlines = np.asarray(loaded.lfm.xlines)[xline_slice] if xline_slice is not None else np.asarray(loaded.lfm.xlines)
+    if args.qc_inline or args.qc_xline:
+        # Validate physical line numbers before starting volume inference;
+        # this also rejects a non-existing line on a stepped xline axis.
+        validate_volume_section_requests(
+            ilines=ilines,
+            xlines=xlines,
+            inline_numbers=args.qc_inline or (),
+            xline_numbers=args.qc_xline or (),
+        )
     result = loaded.predict_volume(
         output_path=output_dir / "piai_log_ai.npy",
         batch_size=args.batch_size,
         inline_slice=inline_slice,
         xline_slice=xline_slice,
     )
+    section_qc = None
+    if args.qc_inline or args.qc_xline:
+        section_qc = write_volume_section_qc(
+            log_ai_path=result.log_ai_path,
+            valid_mask_path=result.valid_mask_path,
+            ilines=ilines,
+            xlines=xlines,
+            sample_axis=loaded.sample_axis,
+            output_dir=output_dir / "qc",
+            inline_numbers=args.qc_inline or (),
+            xline_numbers=args.qc_xline or (),
+        )
     learned_wavelet_path = output_dir / "learned_wavelet.csv"
     write_wavelet_csv(
         learned_wavelet_path,
@@ -93,6 +139,16 @@ def main() -> None:
         result.wavelet_mean_normalized,
         loaded.normalization.seismic_std,
     )
+    closure_qc = None
+    if args.qc_physical_closure:
+        closure_qc = write_volume_closure_qc(
+            loaded.model, loaded.reader, loaded.physics, result.wavelet_mean_normalized,
+            log_ai_path=result.log_ai_path, valid_mask_path=result.valid_mask_path,
+            ilines=ilines, xlines=xlines, output_dir=output_dir / "qc" / "physical_closure",
+            device=next(loaded.model.parameters()).device,
+            inline_numbers=args.qc_inline or (), xline_numbers=args.qc_xline or (),
+            batch_size=loaded.inference_config.batch_size,
+        )
     well_qc_dir = output_dir / "well_qc"
     well_qc_metrics = write_well_qc(
         loaded.model,
@@ -119,13 +175,27 @@ def main() -> None:
         "physical_seismic_reconstruction": "F(log_ai, wavelet_raw) + seismic_mean",
         "wavelet_cohort": well_qc_metrics.get("wavelet_cohort", "predicted_volume_trace_mean"),
     }
+    if section_qc is not None:
+        section_summary = dict(section_qc)
+        section_summary["figures"] = [
+            {
+                **{key: value for key, value in figure.items() if key not in {"png", "svg"}},
+                "png": repo_relative_path(Path(str(figure["png"])), root=REPO_ROOT),
+                "svg": repo_relative_path(Path(str(figure["svg"])), root=REPO_ROOT),
+            }
+            for figure in section_qc["figures"]
+        ]
+        summary["section_qc"] = section_summary
+    if closure_qc is not None:
+        summary["physical_closure_qc"] = {
+            "directory": repo_relative_path(output_dir / "qc" / "physical_closure", root=REPO_ROOT),
+            **closure_qc,
+        }
     if not args.skip_segy_export:
         values = np.load(result.log_ai_path, mmap_mode="r")
         # ``log_ai_to_ai_volume`` iterates in bounded blocks; keep the source
         # memmap instead of materialising a full float64 copy of the volume.
         ai_volume = log_ai_to_ai_volume(values)
-        ilines = np.asarray(loaded.lfm.ilines)[inline_slice] if inline_slice is not None else np.asarray(loaded.lfm.ilines)
-        xlines = np.asarray(loaded.lfm.xlines)[xline_slice] if xline_slice is not None else np.asarray(loaded.lfm.xlines)
         workflow = loaded.workflow
         data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
         seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)

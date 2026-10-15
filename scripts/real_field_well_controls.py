@@ -193,6 +193,14 @@ def _resolve_qc_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[st
     if not isinstance(qc, Mapping) or not qc:
         raise ValueError("Config requires a real_field_well_controls.qc mapping.")
     config = dict(qc)
+    body = section.get("body_smoothing")
+    if body is not None:
+        if not isinstance(body, Mapping) or set(body) != {"fwhm_axis_units"}:
+            raise ValueError("real_field_well_controls.body_smoothing must contain exactly fwhm_axis_units.")
+        if "body_smoothing_fwhm_m" in config or "body_smoothing_fwhm_s" in config:
+            raise ValueError("Configure body smoothing FWHM once, under real_field_well_controls.body_smoothing.")
+        width_key = "body_smoothing_fwhm_m" if workflow.seismic.domain == "depth" else "body_smoothing_fwhm_s"
+        config[width_key] = body["fwhm_axis_units"]
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     if workflow.seismic.domain == "depth":
         key, prefix = "forward_model_inputs_run_dir", "depth_forward_model_inputs"

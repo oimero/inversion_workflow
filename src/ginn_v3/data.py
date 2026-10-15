@@ -705,10 +705,50 @@ def _nearest_control_trace(control: WellControl, geometry: SurveyLineGeometry) -
     return nearest
 
 
-def _resample_native_runs(control: WellControl) -> np.ndarray:
+def _native_supervision_values(control: WellControl, *, curve: str) -> np.ndarray:
+    """Return one immutable native curve selected by the Step-6 contract.
+
+    Step 6 stores the filtered curve as the default and may also
+    persist a body-level smoothed curve.  The body curve is deliberately
+    validated here as a second source: it must have exactly the same native
+    finite support as the filtered curve, so choosing it cannot silently fill
+    gaps or change the supervision interval.
+    """
+
+    selected = str(curve).strip().casefold()
+    if selected not in {"filtered", "body"}:
+        raise ValueError(
+            f"{control.well_name}: unsupported supervision_curve={curve!r}; "
+            "expected 'filtered' or 'body'."
+        )
+    filtered = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
+    if selected == "filtered":
+        return filtered.copy()
+    body_value = getattr(control.native, "native_body_log_ai", None)
+    if body_value is None:
+        raise ValueError(
+            f"{control.well_name}: Step 6 does not contain native_body_log_ai, "
+            "but supervision_curve='body' was requested."
+        )
+    body = np.asarray(body_value, dtype=np.float64)
+    if body.shape != filtered.shape:
+        raise ValueError(
+            f"{control.well_name}: native_body_log_ai shape {body.shape} differs "
+            f"from native_filtered_log_ai shape {filtered.shape}."
+        )
+    filtered_support = np.isfinite(filtered)
+    if not np.array_equal(np.isfinite(body), filtered_support):
+        raise ValueError(
+            f"{control.well_name}: native_body_log_ai finite support differs "
+            "from native_filtered_log_ai; body supervision must preserve gaps."
+        )
+    return body.copy()
+
+
+def _resample_native_runs(control: WellControl, *, curve: str = "filtered") -> np.ndarray:
     axis = np.asarray(control.sample_axis.values, dtype=np.float64)
     native_axis = np.asarray(control.native.coordinates, dtype=np.float64)
-    native_values = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
+    native_values = _native_supervision_values(control, curve=curve)
     finite = np.isfinite(native_values)
     output = np.full(axis.shape, np.nan, dtype=np.float64)
     for start, stop in _finite_runs(finite):
@@ -731,7 +771,12 @@ def build_well_targets(
     lfm_mask: np.ndarray,
     evaluation_supports: Mapping[str, EvaluationSupport],
 ) -> dict[str, WellTarget]:
-    """Build raw native targets for every straight well and fixed QC support."""
+    """Build native targets for every straight well and fixed QC support.
+
+    The Step-6 control set chooses the supervision curve for the complete
+    GINN well target.  ``filtered`` is the default; a persisted ``body`` choice is explicit and never falls back to
+    the filtered curve when its companion data is missing.
+    """
 
     values = np.asarray(lfm_log_ai)
     masks = np.asarray(lfm_mask, dtype=bool)
@@ -744,6 +789,12 @@ def build_well_targets(
         raise ValueError(f"lfm_log_ai and lfm_mask must both have shape {expected}.")
     if np.any(masks & ~np.isfinite(values)) or np.any(np.isfinite(values) & ~masks):
         raise ValueError("lfm_mask must exactly describe finite LFM support.")
+    supervision_curve = str(getattr(controls, "supervision_curve", "filtered")).strip().casefold()
+    if supervision_curve not in {"filtered", "body"}:
+        raise ValueError(
+            f"Unsupported Step-6 supervision_curve={supervision_curve!r}; "
+            "expected 'filtered' or 'body'."
+        )
     support_by_name = {str(name).casefold(): support for name, support in evaluation_supports.items()}
     targets: dict[str, WellTarget] = {}
     for control in controls.controls:
@@ -758,7 +809,7 @@ def build_well_targets(
         if str(getattr(support, "well_name", control.well_name)).casefold() != control.well_name.casefold():
             raise ValueError(f"{control.well_name}: evaluation support well name differs from the control.")
         evaluation_mask = _support_mask(support, controls.sample_axis)
-        target = _resample_native_runs(control)
+        target = _resample_native_runs(control, curve=supervision_curve)
         model_valid = np.asarray(control.valid_mask, dtype=bool)
         _lfm_trace, lfm_valid = _weighted_volume_trace(values, masks, trace_weights)
         valid = np.isfinite(target) & model_valid & lfm_valid

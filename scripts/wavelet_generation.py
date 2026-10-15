@@ -453,18 +453,38 @@ def _add_candidate_regularization_and_score(
     return out
 
 
-def _plot_wavelets(time_s: np.ndarray, wavelets: dict[str, np.ndarray], path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for name, values in wavelets.items():
-        ax.plot(time_s * 1000.0, values, lw=1.0, label=name)
-    ax.axvline(0.0, color="black", lw=0.8, alpha=0.5)
-    ax.set_xlabel("Time (ms)")
-    ax.set_ylabel("Amplitude")
-    ax.set_title("Selected global wavelet")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
+def _plot_wavelets(
+    time_s: np.ndarray,
+    consensus_wavelet: np.ndarray,
+    best_candidate_wavelet: np.ndarray,
+    path: Path,
+) -> None:
+    dt_s = infer_wavelet_dt(time_s)
+    frequency = np.fft.rfftfreq(time_s.size, d=dt_s)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
+    for label, values, color in (
+        ("Consensus", consensus_wavelet, "tab:green"),
+        ("Best candidate", best_candidate_wavelet, "tab:orange"),
+    ):
+        spectrum = np.abs(np.fft.rfft(values))
+        peak = float(np.max(spectrum))
+        if not np.isfinite(peak) or peak <= 0.0:
+            raise ValueError(f"Cannot plot a non-finite or zero-energy {label.lower()} wavelet.")
+        axes[0].plot(time_s * 1000.0, values, lw=1.25, color=color, label=label)
+        axes[1].plot(frequency, spectrum / peak, lw=1.25, color=color)
+    axes[0].axvline(0.0, color="black", lw=0.8, alpha=0.5)
+    axes[0].set_xlabel("Time (ms)")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].legend(loc="best")
+    axes[1].set_xlabel("Frequency (Hz)")
+    axes[1].set_ylabel("Normalized amplitude")
+    axes[1].set_xlim(0.0, min(125.0, float(frequency[-1])))
+    axes[1].set_ylim(bottom=0.0)
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    fig.savefig(path.with_suffix(".svg"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -516,10 +536,14 @@ def _plot_batch_synthetic_qc(
     plt.close(fig)
 
 
-def _tie_horizon_markers_by_well(auto_tie_dir: Path, domain: str = "time") -> dict[str, list[tuple[float, str]]]:
+def _tie_horizon_markers_by_well(
+    auto_tie_dir: Path,
+    domain: str = "time",
+    *,
+    horizons: Sequence[dict[str, Any]],
+) -> dict[str, list[tuple[float, str]]]:
+    """Pair the published tie coordinates with configured horizon names."""
     path = auto_tie_dir / "tie_window_report.csv"
-    if not path.exists():
-        return {}
     rows = pd.read_csv(path)
     top_column = "target_top_tvdss_m" if domain == "depth" else "target_top_twt_s"
     bottom_column = "target_bottom_tvdss_m" if domain == "depth" else "target_bottom_twt_s"
@@ -530,15 +554,35 @@ def _tie_horizon_markers_by_well(auto_tie_dir: Path, domain: str = "time") -> di
         top_column,
         bottom_column,
     }
-    if not required.issubset(rows.columns):
-        return {}
+    missing = required - set(rows.columns)
+    if missing:
+        raise ValueError(f"{path} is missing horizon-marker columns: {sorted(missing)}")
+    display_names: dict[str, str] = {}
+    for spec in horizons:
+        name = str(spec["name"]).strip()
+        file = str(spec["file"]).strip().replace("\\", "/")
+        if not name or not file:
+            raise ValueError("target_interval.horizons requires non-empty name and file values.")
+        # Published time ties identify surfaces by basename, whereas depth
+        # ties carry the configured file path. Both refer to this same spec.
+        for reference in (name, file, Path(file).name):
+            key = reference.casefold()
+            if key in display_names and display_names[key] != name:
+                raise ValueError(f"Ambiguous configured horizon reference: {reference!r}")
+            display_names[key] = name
+
+    def display_name(reference: Any) -> str:
+        key = str(reference).strip().replace("\\", "/").casefold()
+        if key not in display_names:
+            raise ValueError(f"Tie horizon {reference!r} is absent from target_interval.horizons.")
+        return display_names[key]
+
     return {
         normalize_well_name(str(row["well_name"])): [
-            (float(row[top_column]), str(row["target_top_name"])),
-            (float(row[bottom_column]), str(row["target_bottom_name"])),
+            (float(row[top_column]), display_name(row["target_top_name"])),
+            (float(row[bottom_column]), display_name(row["target_bottom_name"])),
         ]
         for _, row in rows.iterrows()
-        if pd.notna(row[top_column]) and pd.notna(row[bottom_column])
     }
 
 
@@ -772,12 +816,16 @@ def main() -> None:
         batch_qcs,
         batch_metrics_df,
         output_dirs["batch_synthetic_qc_figures"],
-        horizon_markers_by_well=_tie_horizon_markers_by_well(source_dirs["auto_tie_dir"], workflow.seismic.domain),
+        horizon_markers_by_well=_tie_horizon_markers_by_well(
+            source_dirs["auto_tie_dir"], workflow.seismic.domain,
+            horizons=cfg["target_interval"]["horizons"],
+        ),
         sample_domain=workflow.seismic.domain,
     )
-    plot_wavelets = {"selected": selected_wavelet, "best_candidate": best_candidate_item["amplitude"]}
-    plot_wavelets["consensus"] = consensus_wavelet
-    _plot_wavelets(wavelet_time_s, plot_wavelets, output_dirs["figures"] / "selected_wavelet.png")
+    _plot_wavelets(
+        wavelet_time_s, consensus_wavelet, best_candidate_item["amplitude"],
+        output_dirs["figures"] / "selected_wavelet.png",
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "success",

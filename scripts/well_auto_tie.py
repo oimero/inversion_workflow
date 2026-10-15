@@ -145,6 +145,7 @@ def normalize_script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "manual_shift": {
                 "default_ms": 0.0,
                 "by_route_ms": {},
+                "wells_ms": {},
                 "config_file": "",
             },
         },
@@ -270,6 +271,7 @@ def _metrics_with_extras(
             "well_role": plan.well_role if plan is not None else "trusted",
             "tie_window_start_s": report.get("tie_window_start_s"),
             "tie_window_end_s": report.get("tie_window_end_s"),
+            "coarse_total_shift_ms": float(report.get("coarse_total_shift_ms", 0.0) or 0.0),
             "tie_window_md_min_m": report.get("tie_window_md_min_m"),
             "tie_window_md_max_m": report.get("tie_window_md_max_m"),
             "target_top_tvdss_m": report.get("target_top_tvdss_m"),
@@ -370,6 +372,7 @@ def _run_workflow(
                     data_root=data_root,
                     repo_root=repo_root,
                     horizon_cache=horizon_cache,
+                    manual_shift_config=manual_cfg,
                 )
                 prepared = depth_prepared.prepared
                 seismic_override = depth_prepared.seismic

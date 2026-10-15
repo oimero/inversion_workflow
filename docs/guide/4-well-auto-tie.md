@@ -98,6 +98,7 @@ well_auto_tie:
     manual_shift:
       default_ms: 0.0
       by_route_ms: {}
+      wells_ms: {}
       config_file: <manual-shift-config-file>
 
   reject:
@@ -173,13 +174,14 @@ anchors:
 
 #### `manual_shift`
 
-人工给某口井加一个整体时间平移，适合已有经验判断或临时排查。
+人工给某口井的初始时深关系加一个整体时间平移，适合已有经验判断或临时排查。正值向较晚时间移动，负值向较早时间移动。自动细调以粗偏移后的关系为起点继续搜索，最终总时移为粗偏移与细调时移之和。
 
 手动偏移规则：
 
 - `manual_shift.default_ms` 是全局默认值。
 - `manual_shift.by_route_ms` 可按路线提供覆盖值。
-- `manual_shift.config_file` 指向单井手动偏移文件；文件里的 `manual_shift.wells_ms.<well-name>` 覆盖路线值，优先级最高。
+- `manual_shift.wells_ms` 可直接提供单井覆盖值，井名匹配不区分大小写。
+- `manual_shift.config_file` 指向单井手动偏移文件；文件里的值覆盖配置段内的同名值，优先级最高。
 
 单井手动偏移文件形如：
 
@@ -189,10 +191,10 @@ manual_shift:
   by_route_ms:
     vertical_with_tdt: 0.0
   wells_ms:
-    <well-name>: 0.0
+    <well-name>: 12.0
 ```
 
-所有路径的手动偏移默认都是 0。
+配置文件和内联配置中的井名如果只是在大小写上不同，也视为同一口井；同一口井同时出现时，配置文件中的值覆盖内联值。所有路径的手动偏移默认都是 0。
 
 ### `reject`
 
@@ -262,7 +264,7 @@ manual_shift:
 | 文件 | 内容 |
 |------|------|
 | `well_tie_plan.csv` | 一井一行的路由计划 |
-| `well_tie_metrics.csv` | 已执行井的标定指标和输出路径 |
+| `well_tie_metrics.csv` | 已执行井的标定指标、粗校正总时移和输出路径 |
 | `rejected_wells.csv` | 路由阶段被拒绝的井及原因 |
 | `tie_window_report.csv` | 目标窗口、实际窗口、TDT 来源、粗校正量和裁剪原因 |
 | `anchor_report.csv` | 时间域锚点路线的锚点 MD/TWT、层位采样信息和锚点作用 |
